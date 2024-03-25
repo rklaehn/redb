@@ -4,7 +4,8 @@ use std::io::ErrorKind;
 use rand::prelude::SliceRandom;
 use rand::Rng;
 use redb::{
-    Builder, Database, Durability, MultimapTableDefinition, ReadableTable, TableDefinition,
+    Builder, Database, Durability, MultimapTableDefinition, ReadableTable, ReadableTableMetadata,
+    TableDefinition,
 };
 use redb::{DatabaseError, ReadableMultimapTable, SavepointError, StorageError, TableError};
 
@@ -864,21 +865,32 @@ fn regression20() {
 }
 
 #[test]
-fn regression21() {
+fn check_integrity_clean() {
     let tmpfile = create_tempfile();
-    let db = Database::builder().create(tmpfile.path()).unwrap();
+
+    let table_def: TableDefinition<'static, u64, u64> = TableDefinition::new("x");
+
+    let mut db = Database::builder().create(tmpfile.path()).unwrap();
+    assert!(db.check_integrity().unwrap());
 
     let txn = db.begin_write().unwrap();
-    let mut table = txn.open_table(U64_TABLE).unwrap();
+    let mut table = txn.open_table(table_def).unwrap();
 
-    for i in 0..100 {
-        table.insert(i, i).unwrap();
+    for i in 0..10 {
+        table.insert(0, i).unwrap();
     }
-
-    table.drain(..1).unwrap();
-
     drop(table);
+
     txn.commit().unwrap();
+    assert!(db.check_integrity().unwrap());
+    drop(db);
+
+    let mut db = Database::builder().create(tmpfile.path()).unwrap();
+    assert!(db.check_integrity().unwrap());
+    drop(db);
+
+    let mut db = Database::builder().open(tmpfile.path()).unwrap();
+    assert!(db.check_integrity().unwrap());
 }
 
 #[test]

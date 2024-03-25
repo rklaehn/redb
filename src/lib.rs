@@ -66,12 +66,12 @@ pub use multimap_table::{
     ReadOnlyUntypedMultimapTable, ReadableMultimapTable,
 };
 pub use table::{
-    Drain, DrainFilter, Range, ReadOnlyTable, ReadOnlyUntypedTable, ReadableTable, Table,
-    TableStats,
+    ExtractIf, Range, ReadOnlyTable, ReadOnlyUntypedTable, ReadableTable, ReadableTableMetadata,
+    Table, TableStats,
 };
 pub use transactions::{DatabaseStats, Durability, ReadTransaction, WriteTransaction};
 pub use tree_store::{AccessGuard, AccessGuardMut, Savepoint};
-pub use types::{MutInPlaceValue, RedbKey, RedbValue, TypeName};
+pub use types::{Key, MutInPlaceValue, TypeName, Value};
 
 type Result<T = (), E = StorageError> = std::result::Result<T, E>;
 

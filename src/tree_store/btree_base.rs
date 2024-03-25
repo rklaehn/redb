@@ -2,13 +2,14 @@ use crate::tree_store::page_store::{
     xxh3_checksum, CachePriority, Page, PageImpl, PageMut, TransactionalMemory,
 };
 use crate::tree_store::PageNumber;
-use crate::types::{MutInPlaceValue, RedbKey, RedbValue};
+use crate::types::{Key, MutInPlaceValue, Value};
 use crate::{Result, StorageError};
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::ops::Range;
-use std::{mem, thread};
+use std::sync::Arc;
+use std::thread;
 
 pub(crate) const LEAF: u8 = 1;
 pub(crate) const BRANCH: u8 = 2;
@@ -54,71 +55,118 @@ pub(super) fn branch_checksum<T: Page>(
     }
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct BtreeHeader {
+    pub(crate) root: PageNumber,
+    pub(crate) checksum: Checksum,
+    pub(crate) length: u64,
+}
+
+impl BtreeHeader {
+    pub(crate) fn new(root: PageNumber, checksum: Checksum, length: u64) -> Self {
+        Self {
+            root,
+            checksum,
+            length,
+        }
+    }
+
+    pub(crate) const fn serialized_size() -> usize {
+        PageNumber::serialized_size() + size_of::<Checksum>() + size_of::<u64>()
+    }
+
+    pub(crate) fn from_le_bytes(bytes: [u8; Self::serialized_size()]) -> Self {
+        let root =
+            PageNumber::from_le_bytes(bytes[..PageNumber::serialized_size()].try_into().unwrap());
+        let mut offset = PageNumber::serialized_size();
+        let checksum = Checksum::from_le_bytes(
+            bytes[offset..(offset + size_of::<Checksum>())]
+                .try_into()
+                .unwrap(),
+        );
+        offset += size_of::<Checksum>();
+        let length = u64::from_le_bytes(
+            bytes[offset..(offset + size_of::<u64>())]
+                .try_into()
+                .unwrap(),
+        );
+
+        Self {
+            root,
+            checksum,
+            length,
+        }
+    }
+
+    pub(crate) fn to_le_bytes(self) -> [u8; Self::serialized_size()] {
+        let mut result = [0; Self::serialized_size()];
+        result[..PageNumber::serialized_size()].copy_from_slice(&self.root.to_le_bytes());
+        result[PageNumber::serialized_size()
+            ..(PageNumber::serialized_size() + size_of::<Checksum>())]
+            .copy_from_slice(&self.checksum.to_le_bytes());
+        result[(PageNumber::serialized_size() + size_of::<Checksum>())..]
+            .copy_from_slice(&self.length.to_le_bytes());
+
+        result
+    }
+}
+
 enum OnDrop {
     None,
-    Free(PageNumber),
     RemoveEntry {
         position: usize,
         fixed_key_size: Option<usize>,
     },
 }
 
-enum EitherPage<'a> {
-    Immutable(PageImpl<'a>),
-    Mutable(PageMut<'a>),
+enum EitherPage {
+    Immutable(PageImpl),
+    Mutable(PageMut),
     OwnedMemory(Vec<u8>),
+    ArcMemory(Arc<Vec<u8>>),
 }
 
-impl<'a> EitherPage<'a> {
+impl EitherPage {
     fn memory(&self) -> &[u8] {
         match self {
             EitherPage::Immutable(page) => page.memory(),
             EitherPage::Mutable(page) => page.memory(),
             EitherPage::OwnedMemory(mem) => mem.as_slice(),
+            EitherPage::ArcMemory(mem) => mem.as_slice(),
         }
     }
 }
 
-pub struct AccessGuard<'a, V: RedbValue> {
-    page: EitherPage<'a>,
+pub struct AccessGuard<'a, V: Value + 'static> {
+    page: EitherPage,
     offset: usize,
     len: usize,
     on_drop: OnDrop,
-    mem: Option<&'a TransactionalMemory>,
     _value_type: PhantomData<V>,
+    // Used so that logical references into a Table respect the appropriate lifetime
+    _lifetime: PhantomData<&'a ()>,
 }
 
-impl<'a, V: RedbValue> AccessGuard<'a, V> {
-    pub(super) fn new(
-        page: PageImpl<'a>,
-        offset: usize,
-        len: usize,
-        free_on_drop: bool,
-        mem: &'a TransactionalMemory,
-    ) -> Self {
-        let page_number = page.get_page_number();
-        Self {
-            page: EitherPage::Immutable(page),
-            offset,
-            len,
-            on_drop: if free_on_drop {
-                OnDrop::Free(page_number)
-            } else {
-                OnDrop::None
-            },
-            mem: Some(mem),
-            _value_type: Default::default(),
-        }
-    }
-
-    pub(crate) fn with_page(page: PageImpl<'a>, range: Range<usize>) -> Self {
+impl<'a, V: Value + 'static> AccessGuard<'a, V> {
+    pub(crate) fn with_page(page: PageImpl, range: Range<usize>) -> Self {
         Self {
             page: EitherPage::Immutable(page),
             offset: range.start,
             len: range.len(),
             on_drop: OnDrop::None,
-            mem: None,
             _value_type: Default::default(),
+            _lifetime: Default::default(),
+        }
+    }
+
+    pub(crate) fn with_arc_page(page: Arc<Vec<u8>>, range: Range<usize>) -> Self {
+        Self {
+            page: EitherPage::ArcMemory(page),
+            offset: range.start,
+            len: range.len(),
+            on_drop: OnDrop::None,
+            _value_type: Default::default(),
+            _lifetime: Default::default(),
         }
     }
 
@@ -129,18 +177,17 @@ impl<'a, V: RedbValue> AccessGuard<'a, V> {
             offset: 0,
             len,
             on_drop: OnDrop::None,
-            mem: None,
             _value_type: Default::default(),
+            _lifetime: Default::default(),
         }
     }
 
     pub(super) fn remove_on_drop(
-        page: PageMut<'a>,
+        page: PageMut,
         offset: usize,
         len: usize,
         position: usize,
         fixed_key_size: Option<usize>,
-        mem: &'a TransactionalMemory,
     ) -> Self {
         Self {
             page: EitherPage::Mutable(page),
@@ -150,8 +197,8 @@ impl<'a, V: RedbValue> AccessGuard<'a, V> {
                 position,
                 fixed_key_size,
             },
-            mem: Some(mem),
             _value_type: Default::default(),
+            _lifetime: Default::default(),
         }
     }
 
@@ -160,17 +207,10 @@ impl<'a, V: RedbValue> AccessGuard<'a, V> {
     }
 }
 
-impl<'a, V: RedbValue> Drop for AccessGuard<'a, V> {
+impl<'a, V: Value + 'static> Drop for AccessGuard<'a, V> {
     fn drop(&mut self) {
         match self.on_drop {
             OnDrop::None => {}
-            OnDrop::Free(page_number) => {
-                // Drop our reference to the page, so that it can be freed
-                let mut dummy = EitherPage::OwnedMemory(vec![]);
-                mem::swap(&mut self.page, &mut dummy);
-                drop(dummy);
-                self.mem.unwrap().free(page_number);
-            }
             OnDrop::RemoveEntry {
                 position,
                 fixed_key_size,
@@ -186,25 +226,28 @@ impl<'a, V: RedbValue> Drop for AccessGuard<'a, V> {
     }
 }
 
-pub struct AccessGuardMut<'a, V: RedbValue> {
-    page: PageMut<'a>,
+pub struct AccessGuardMut<'a, V: Value + 'static> {
+    page: PageMut,
     offset: usize,
     len: usize,
     _value_type: PhantomData<V>,
+    // Used so that logical references into a Table respect the appropriate lifetime
+    _lifetime: PhantomData<&'a ()>,
 }
 
-impl<'a, V: RedbValue> AccessGuardMut<'a, V> {
-    pub(crate) fn new(page: PageMut<'a>, offset: usize, len: usize) -> Self {
+impl<'a, V: Value + 'static> AccessGuardMut<'a, V> {
+    pub(crate) fn new(page: PageMut, offset: usize, len: usize) -> Self {
         AccessGuardMut {
             page,
             offset,
             len,
             _value_type: Default::default(),
+            _lifetime: Default::default(),
         }
     }
 }
 
-impl<'a, V: MutInPlaceValue> AsMut<V::BaseRefType> for AccessGuardMut<'a, V> {
+impl<'a, V: MutInPlaceValue + 'static> AsMut<V::BaseRefType> for AccessGuardMut<'a, V> {
     fn as_mut(&mut self) -> &mut V::BaseRefType {
         V::from_bytes_mut(&mut self.page.memory_mut()[self.offset..(self.offset + self.len)])
     }
@@ -256,7 +299,7 @@ impl<'a> LeafAccessor<'a> {
         }
     }
 
-    pub(super) fn print_node<K: RedbKey, V: RedbValue>(&self, include_value: bool) {
+    pub(super) fn print_node<K: Key, V: Value>(&self, include_value: bool) {
         let mut i = 0;
         while let Some(entry) = self.entry(i) {
             eprint!(" key_{}={:?}", i, K::from_bytes(entry.key()));
@@ -267,7 +310,7 @@ impl<'a> LeafAccessor<'a> {
         }
     }
 
-    pub(crate) fn position<K: RedbKey>(&self, query: &[u8]) -> (usize, bool) {
+    pub(crate) fn position<K: Key>(&self, query: &[u8]) -> (usize, bool) {
         // inclusive
         let mut min_entry = 0;
         // inclusive. Start past end, since it might be positioned beyond the end of the leaf
@@ -291,7 +334,7 @@ impl<'a> LeafAccessor<'a> {
         (min_entry, false)
     }
 
-    pub(crate) fn find_key<K: RedbKey>(&self, query: &[u8]) -> Option<usize> {
+    pub(crate) fn find_key<K: Key>(&self, query: &[u8]) -> Option<usize> {
         let (entry, found) = self.position::<K>(query);
         if found {
             Some(entry)
@@ -496,7 +539,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         required_size > self.mem.get_page_size() && self.pairs.len() > 1
     }
 
-    pub(super) fn build_split(self) -> Result<(PageMut<'b>, &'a [u8], PageMut<'b>)> {
+    pub(super) fn build_split(self) -> Result<(PageMut, &'a [u8], PageMut)> {
         let total_size = self.total_key_bytes + self.total_value_bytes;
         let mut division = 0;
         let mut first_split_key_bytes = 0;
@@ -547,7 +590,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         Ok((page1, self.pairs[division - 1].0, page2))
     }
 
-    pub(super) fn build(self) -> Result<PageMut<'b>> {
+    pub(super) fn build(self) -> Result<PageMut> {
         let required_size = self.required_bytes(
             self.pairs.len(),
             self.total_key_bytes + self.total_value_bytes,
@@ -740,15 +783,15 @@ impl<'a> Drop for RawLeafBuilder<'a> {
     }
 }
 
-pub(crate) struct LeafMutator<'a: 'b, 'b> {
-    page: &'b mut PageMut<'a>,
+pub(crate) struct LeafMutator<'b> {
+    page: &'b mut PageMut,
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
 }
 
-impl<'a: 'b, 'b> LeafMutator<'a, 'b> {
+impl<'b> LeafMutator<'b> {
     pub(crate) fn new(
-        page: &'b mut PageMut<'a>,
+        page: &'b mut PageMut,
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
     ) -> Self {
@@ -761,7 +804,7 @@ impl<'a: 'b, 'b> LeafMutator<'a, 'b> {
     }
 
     pub(super) fn sufficient_insert_inplace_space(
-        page: &'_ PageImpl<'_>,
+        page: &'_ PageImpl,
         position: usize,
         overwrite: bool,
         fixed_key_size: Option<usize>,
@@ -1082,7 +1125,7 @@ impl<'a: 'b, 'b, T: Page + 'a> BranchAccessor<'a, 'b, T> {
         }
     }
 
-    pub(super) fn print_node<K: RedbKey>(&self) {
+    pub(super) fn print_node<K: Key>(&self) {
         eprint!(
             "Internal[ (page={:?}), child_0={:?}",
             self.page.get_page_number(),
@@ -1103,7 +1146,7 @@ impl<'a: 'b, 'b, T: Page + 'a> BranchAccessor<'a, 'b, T> {
         self.key_end(self.num_keys() - 1)
     }
 
-    pub(super) fn child_for_key<K: RedbKey>(&self, query: &[u8]) -> (usize, PageNumber) {
+    pub(super) fn child_for_key<K: Key>(&self, query: &[u8]) -> (usize, PageNumber) {
         let mut min_child = 0; // inclusive
         let mut max_child = self.num_keys(); // inclusive
         while min_child < max_child {
@@ -1256,7 +1299,7 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
         }
     }
 
-    pub(super) fn build(self) -> Result<PageMut<'b>> {
+    pub(super) fn build(self) -> Result<PageMut> {
         assert_eq!(self.children.len(), self.keys.len() + 1);
         let size = RawBranchBuilder::required_bytes(
             self.keys.len(),
@@ -1284,7 +1327,7 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
         size > self.mem.get_page_size() && self.keys.len() >= 3
     }
 
-    pub(super) fn build_split(self) -> Result<(PageMut<'b>, &'a [u8], PageMut<'b>)> {
+    pub(super) fn build_split(self) -> Result<(PageMut, &'a [u8], PageMut)> {
         assert_eq!(self.children.len(), self.keys.len() + 1);
         assert!(self.keys.len() >= 3);
         let division = self.keys.len() / 2;
@@ -1350,14 +1393,14 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
 // * 4 bytes: key end. Ending offset of the key, exclusive
 // repeating (num_keys times):
 // * n bytes: key data
-pub(super) struct RawBranchBuilder<'a: 'b, 'b> {
-    page: &'b mut PageMut<'a>,
+pub(super) struct RawBranchBuilder<'b> {
+    page: &'b mut PageMut,
     fixed_key_size: Option<usize>,
     num_keys: usize,
     keys_written: usize, // used for debugging
 }
 
-impl<'a: 'b, 'b> RawBranchBuilder<'a, 'b> {
+impl<'b> RawBranchBuilder<'b> {
     pub(super) fn required_bytes(
         num_keys: usize,
         size_of_keys: usize,
@@ -1377,7 +1420,7 @@ impl<'a: 'b, 'b> RawBranchBuilder<'a, 'b> {
 
     // Caller MUST write num_keys values
     pub(super) fn new(
-        page: &'b mut PageMut<'a>,
+        page: &'b mut PageMut,
         num_keys: usize,
         fixed_key_size: Option<usize>,
     ) -> Self {
@@ -1478,7 +1521,7 @@ impl<'a: 'b, 'b> RawBranchBuilder<'a, 'b> {
     }
 }
 
-impl<'a: 'b, 'b> Drop for RawBranchBuilder<'a, 'b> {
+impl<'b> Drop for RawBranchBuilder<'b> {
     fn drop(&mut self) {
         if !thread::panicking() {
             assert_eq!(self.keys_written, self.num_keys);
@@ -1486,12 +1529,12 @@ impl<'a: 'b, 'b> Drop for RawBranchBuilder<'a, 'b> {
     }
 }
 
-pub(super) struct BranchMutator<'a: 'b, 'b> {
-    page: &'b mut PageMut<'a>,
+pub(super) struct BranchMutator<'b> {
+    page: &'b mut PageMut,
 }
 
-impl<'a: 'b, 'b> BranchMutator<'a, 'b> {
-    pub(super) fn new(page: &'b mut PageMut<'a>) -> Self {
+impl<'b> BranchMutator<'b> {
+    pub(super) fn new(page: &'b mut PageMut) -> Self {
         assert_eq!(page.memory()[0], BRANCH);
         Self { page }
     }

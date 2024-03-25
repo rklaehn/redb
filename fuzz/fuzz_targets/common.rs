@@ -133,14 +133,23 @@ pub(crate) enum FuzzOperation {
     },
     PopLast {
     },
-    Drain {
+    Retain {
+        modulus: U64Between<1, 8>,
+    },
+    RetainIn {
         start_key: BoundedU64<KEY_SPACE>,
         len: BoundedU64<KEY_SPACE>,
+        modulus: U64Between<1, 8>,
+    },
+    ExtractIf {
+        modulus: U64Between<1, 8>,
+        take: BoundedUSize<10>,
         reversed: bool,
     },
-    DrainFilter {
+    ExtractFromIf {
         start_key: BoundedU64<KEY_SPACE>,
-        len: BoundedU64<KEY_SPACE>,
+        range_len: BoundedU64<KEY_SPACE>,
+        take: BoundedUSize<10>,
         modulus: U64Between<1, 8>,
         reversed: bool,
     },

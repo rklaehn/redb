@@ -1,13 +1,15 @@
+use crate::db::TransactionGuard;
 use crate::sealed::Sealed;
 use crate::tree_store::{
-    AccessGuardMut, Btree, BtreeDrain, BtreeDrainFilter, BtreeMut, BtreeRangeIter, Checksum,
-    PageHint, PageNumber, RawBtree, TransactionalMemory, MAX_VALUE_LENGTH,
+    AccessGuardMut, Btree, BtreeExtractIf, BtreeHeader, BtreeMut, BtreeRangeIter, PageHint,
+    PageNumber, RawBtree, TransactionalMemory, MAX_VALUE_LENGTH,
 };
-use crate::types::{MutInPlaceValue, RedbKey, RedbValue};
+use crate::types::{Key, MutInPlaceValue, Value};
 use crate::{AccessGuard, StorageError, WriteTransaction};
 use crate::{Result, TableHandle};
 use std::borrow::Borrow;
 use std::fmt::{Debug, Formatter};
+use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
 
@@ -56,30 +58,35 @@ impl TableStats {
 }
 
 /// A table containing key-value mappings
-pub struct Table<'db, 'txn, K: RedbKey + 'static, V: RedbValue + 'static> {
+pub struct Table<'txn, K: Key + 'static, V: Value + 'static> {
     name: String,
-    transaction: &'txn WriteTransaction<'db>,
+    transaction: &'txn WriteTransaction,
     tree: BtreeMut<'txn, K, V>,
 }
 
-impl<K: RedbKey + 'static, V: RedbValue + 'static> TableHandle for Table<'_, '_, K, V> {
+impl<K: Key + 'static, V: Value + 'static> TableHandle for Table<'_, K, V> {
     fn name(&self) -> &str {
         &self.name
     }
 }
 
-impl<'db, 'txn, K: RedbKey + 'static, V: RedbValue + 'static> Table<'db, 'txn, K, V> {
+impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
     pub(crate) fn new(
         name: &str,
-        table_root: Option<(PageNumber, Checksum)>,
+        table_root: Option<BtreeHeader>,
         freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-        mem: &'db TransactionalMemory,
-        transaction: &'txn WriteTransaction<'db>,
-    ) -> Table<'db, 'txn, K, V> {
+        mem: Arc<TransactionalMemory>,
+        transaction: &'txn WriteTransaction,
+    ) -> Table<'txn, K, V> {
         Table {
             name: name.to_string(),
             transaction,
-            tree: BtreeMut::new(table_root, mem, freed_pages),
+            tree: BtreeMut::new(
+                table_root,
+                transaction.transaction_guard(),
+                mem,
+                freed_pages,
+            ),
         }
     }
 
@@ -124,33 +131,56 @@ impl<'db, 'txn, K: RedbKey + 'static, V: RedbValue + 'static> Table<'db, 'txn, K
         }
     }
 
-    /// Removes the specified range and returns the removed entries in an iterator
+    /// Applies `predicate` to all key-value pairs. All entries for which
+    /// `predicate` evaluates to `true` are returned in an iterator, and those which are read from the iterator are removed
     ///
-    /// The iterator will consume all items in the range on drop.
-    pub fn drain<'a, KR>(&mut self, range: impl RangeBounds<KR> + 'a) -> Result<Drain<K, V>>
-    where
-        K: 'a,
-        KR: Borrow<K::SelfType<'a>> + 'a,
-    {
-        self.tree.drain(&range).map(Drain::new)
+    /// Note: values not read from the iterator will not be removed
+    pub fn extract_if<F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>(
+        &mut self,
+        predicate: F,
+    ) -> Result<ExtractIf<K, V, F>> {
+        self.extract_from_if::<K::SelfType<'_>, F>(.., predicate)
     }
 
     /// Applies `predicate` to all key-value pairs in the specified range. All entries for which
-    /// `predicate` evaluates to `true` are removed and returned in an iterator
+    /// `predicate` evaluates to `true` are returned in an iterator, and those which are read from the iterator are removed
     ///
-    /// The iterator will consume all items in the range matching the predicate on drop.
-    pub fn drain_filter<'a, KR, F: for<'f> Fn(K::SelfType<'f>, V::SelfType<'f>) -> bool>(
+    /// Note: values not read from the iterator will not be removed
+    pub fn extract_from_if<'a, KR, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>(
         &mut self,
         range: impl RangeBounds<KR> + 'a,
         predicate: F,
-    ) -> Result<DrainFilter<K, V, F>>
+    ) -> Result<ExtractIf<K, V, F>>
     where
-        K: 'a,
         KR: Borrow<K::SelfType<'a>> + 'a,
     {
         self.tree
-            .drain_filter(&range, predicate)
-            .map(DrainFilter::new)
+            .extract_from_if(&range, predicate)
+            .map(ExtractIf::new)
+    }
+
+    /// Applies `predicate` to all key-value pairs. All entries for which
+    /// `predicate` evaluates to `false` are removed.
+    ///
+    pub fn retain<F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>(
+        &mut self,
+        predicate: F,
+    ) -> Result {
+        self.tree.retain_in::<K::SelfType<'_>, F>(predicate, ..)
+    }
+
+    /// Applies `predicate` to all key-value pairs in the range `start..end`. All entries for which
+    /// `predicate` evaluates to `false` are removed.
+    ///
+    pub fn retain_in<'a, KR, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>(
+        &mut self,
+        range: impl RangeBounds<KR> + 'a,
+        predicate: F,
+    ) -> Result
+    where
+        KR: Borrow<K::SelfType<'a>> + 'a,
+    {
+        self.tree.retain_in(predicate, range)
     }
 
     /// Insert mapping of the given key to the given value
@@ -178,25 +208,19 @@ impl<'db, 'txn, K: RedbKey + 'static, V: RedbValue + 'static> Table<'db, 'txn, K
     pub fn remove<'a>(
         &mut self,
         key: impl Borrow<K::SelfType<'a>>,
-    ) -> Result<Option<AccessGuard<V>>>
-    where
-        K: 'a,
-    {
+    ) -> Result<Option<AccessGuard<V>>> {
         self.tree.remove(key.borrow())
     }
 }
 
-impl<'db, 'txn, K: RedbKey + 'static, V: MutInPlaceValue + 'static> Table<'db, 'txn, K, V> {
+impl<'txn, K: Key + 'static, V: MutInPlaceValue + 'static> Table<'txn, K, V> {
     /// Reserve space to insert a key-value pair
     /// The returned reference will have length equal to value_length
     pub fn insert_reserve<'a>(
         &mut self,
         key: impl Borrow<K::SelfType<'a>>,
         value_length: u32,
-    ) -> Result<AccessGuardMut<V>>
-    where
-        K: 'a,
-    {
+    ) -> Result<AccessGuardMut<V>> {
         if value_length as usize > MAX_VALUE_LENGTH {
             return Err(StorageError::ValueTooLarge(value_length as usize));
         }
@@ -208,24 +232,7 @@ impl<'db, 'txn, K: RedbKey + 'static, V: MutInPlaceValue + 'static> Table<'db, '
     }
 }
 
-impl<'db, 'txn, K: RedbKey + 'static, V: RedbValue + 'static> ReadableTable<K, V>
-    for Table<'db, 'txn, K, V>
-{
-    fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> Result<Option<AccessGuard<V>>>
-    where
-        K: 'a,
-    {
-        self.tree.get(key.borrow())
-    }
-
-    fn range<'a, KR>(&self, range: impl RangeBounds<KR> + 'a) -> Result<Range<K, V>>
-    where
-        K: 'a,
-        KR: Borrow<K::SelfType<'a>> + 'a,
-    {
-        self.tree.range(&range).map(Range::new)
-    }
-
+impl<'txn, K: Key + 'static, V: Value + 'static> ReadableTableMetadata for Table<'txn, K, V> {
     fn stats(&self) -> Result<TableStats> {
         let tree_stats = self.tree.stats()?;
 
@@ -242,21 +249,36 @@ impl<'db, 'txn, K: RedbKey + 'static, V: RedbValue + 'static> ReadableTable<K, V
     fn len(&self) -> Result<u64> {
         self.tree.len()
     }
+}
 
-    fn is_empty(&self) -> Result<bool> {
-        self.len().map(|x| x == 0)
+impl<'txn, K: Key + 'static, V: Value + 'static> ReadableTable<K, V> for Table<'txn, K, V> {
+    fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> Result<Option<AccessGuard<V>>> {
+        self.tree.get(key.borrow())
+    }
+
+    fn range<'a, KR>(&self, range: impl RangeBounds<KR> + 'a) -> Result<Range<K, V>>
+    where
+        KR: Borrow<K::SelfType<'a>> + 'a,
+    {
+        self.tree
+            .range(&range)
+            .map(|x| Range::new(x, self.transaction.transaction_guard()))
     }
 }
 
-impl<K: RedbKey, V: RedbValue> Sealed for Table<'_, '_, K, V> {}
+impl<K: Key, V: Value> Sealed for Table<'_, K, V> {}
 
-impl<'db, 'txn, K: RedbKey + 'static, V: RedbValue + 'static> Drop for Table<'db, 'txn, K, V> {
+impl<'txn, K: Key + 'static, V: Value + 'static> Drop for Table<'txn, K, V> {
     fn drop(&mut self) {
-        self.transaction.close_table(&self.name, &self.tree);
+        self.transaction.close_table(
+            &self.name,
+            &self.tree,
+            self.tree.get_root().map(|x| x.length).unwrap_or_default(),
+        );
     }
 }
 
-fn debug_helper<K: RedbKey + 'static, V: RedbValue + 'static>(
+fn debug_helper<K: Key + 'static, V: Value + 'static>(
     f: &mut Formatter<'_>,
     name: &str,
     len: Result<u64>,
@@ -299,17 +321,28 @@ fn debug_helper<K: RedbKey + 'static, V: RedbValue + 'static>(
     Ok(())
 }
 
-impl<K: RedbKey + 'static, V: RedbValue + 'static> Debug for Table<'_, '_, K, V> {
+impl<K: Key + 'static, V: Value + 'static> Debug for Table<'_, K, V> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         debug_helper(f, &self.name, self.len(), self.first(), self.last())
     }
 }
 
-pub trait ReadableTable<K: RedbKey + 'static, V: RedbValue + 'static>: Sealed {
+pub trait ReadableTableMetadata: Sealed {
+    /// Retrieves information about storage usage for the table
+    fn stats(&self) -> Result<TableStats>;
+
+    /// Returns the number of entries in the table
+    fn len(&self) -> Result<u64>;
+
+    /// Returns `true` if the table is empty
+    fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+}
+
+pub trait ReadableTable<K: Key + 'static, V: Value + 'static>: ReadableTableMetadata {
     /// Returns the value corresponding to the given key
-    fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> Result<Option<AccessGuard<V>>>
-    where
-        K: 'a;
+    fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> Result<Option<AccessGuard<V>>>;
 
     /// Returns a double-ended iterator over a range of elements in the table
     ///
@@ -345,7 +378,6 @@ pub trait ReadableTable<K: RedbKey + 'static, V: RedbValue + 'static>: Sealed {
     /// ```
     fn range<'a, KR>(&self, range: impl RangeBounds<KR> + 'a) -> Result<Range<K, V>>
     where
-        K: 'a,
         KR: Borrow<K::SelfType<'a>> + 'a;
 
     /// Returns the first key-value pair in the table, if it exists
@@ -358,15 +390,6 @@ pub trait ReadableTable<K: RedbKey + 'static, V: RedbValue + 'static>: Sealed {
         self.iter()?.next_back().transpose()
     }
 
-    /// Retrieves information about storage usage for the table
-    fn stats(&self) -> Result<TableStats>;
-
-    /// Returns the number of entries in the table
-    fn len(&self) -> Result<u64>;
-
-    /// Returns `true` if the table is empty
-    fn is_empty(&self) -> Result<bool>;
-
     /// Returns a double-ended iterator over all elements in the table
     fn iter(&self) -> Result<Range<K, V>> {
         self.range::<K::SelfType<'_>>(..)
@@ -374,75 +397,14 @@ pub trait ReadableTable<K: RedbKey + 'static, V: RedbValue + 'static>: Sealed {
 }
 
 /// A read-only untyped table
-pub struct ReadOnlyUntypedTable<'txn> {
-    tree: RawBtree<'txn>,
+pub struct ReadOnlyUntypedTable {
+    tree: RawBtree,
 }
 
-impl<'txn> ReadOnlyUntypedTable<'txn> {
-    pub(crate) fn new(
-        root_page: Option<(PageNumber, Checksum)>,
-        fixed_key_size: Option<usize>,
-        fixed_value_size: Option<usize>,
-        mem: &'txn TransactionalMemory,
-    ) -> Self {
-        Self {
-            tree: RawBtree::new(root_page, fixed_key_size, fixed_value_size, mem),
-        }
-    }
+impl Sealed for ReadOnlyUntypedTable {}
 
+impl ReadableTableMetadata for ReadOnlyUntypedTable {
     /// Retrieves information about storage usage for the table
-    pub fn stats(&self) -> Result<TableStats> {
-        let tree_stats = self.tree.stats()?;
-
-        Ok(TableStats {
-            tree_height: tree_stats.tree_height,
-            leaf_pages: tree_stats.leaf_pages,
-            branch_pages: tree_stats.branch_pages,
-            stored_leaf_bytes: tree_stats.stored_leaf_bytes,
-            metadata_bytes: tree_stats.metadata_bytes,
-            fragmented_bytes: tree_stats.fragmented_bytes,
-        })
-    }
-}
-
-/// A read-only table
-pub struct ReadOnlyTable<'txn, K: RedbKey + 'static, V: RedbValue + 'static> {
-    name: String,
-    tree: Btree<'txn, K, V>,
-}
-
-impl<'txn, K: RedbKey + 'static, V: RedbValue + 'static> ReadOnlyTable<'txn, K, V> {
-    pub(crate) fn new(
-        name: String,
-        root_page: Option<(PageNumber, Checksum)>,
-        hint: PageHint,
-        mem: &'txn TransactionalMemory,
-    ) -> Result<ReadOnlyTable<'txn, K, V>> {
-        Ok(ReadOnlyTable {
-            name,
-            tree: Btree::new(root_page, hint, mem)?,
-        })
-    }
-}
-
-impl<'txn, K: RedbKey + 'static, V: RedbValue + 'static> ReadableTable<K, V>
-    for ReadOnlyTable<'txn, K, V>
-{
-    fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> Result<Option<AccessGuard<V>>>
-    where
-        K: 'a,
-    {
-        self.tree.get(key.borrow())
-    }
-
-    fn range<'a, KR>(&self, range: impl RangeBounds<KR> + 'a) -> Result<Range<K, V>>
-    where
-        K: 'a,
-        KR: Borrow<K::SelfType<'a>> + 'a,
-    {
-        self.tree.range(&range).map(Range::new)
-    }
-
     fn stats(&self) -> Result<TableStats> {
         let tree_stats = self.tree.stats()?;
 
@@ -459,83 +421,131 @@ impl<'txn, K: RedbKey + 'static, V: RedbValue + 'static> ReadableTable<K, V>
     fn len(&self) -> Result<u64> {
         self.tree.len()
     }
+}
 
-    fn is_empty(&self) -> Result<bool> {
-        self.len().map(|x| x == 0)
+impl ReadOnlyUntypedTable {
+    pub(crate) fn new(
+        root_page: Option<BtreeHeader>,
+        fixed_key_size: Option<usize>,
+        fixed_value_size: Option<usize>,
+        mem: Arc<TransactionalMemory>,
+    ) -> Self {
+        Self {
+            tree: RawBtree::new(root_page, fixed_key_size, fixed_value_size, mem),
+        }
     }
 }
 
-impl<K: RedbKey, V: RedbValue> Sealed for ReadOnlyTable<'_, K, V> {}
+/// A read-only table
+pub struct ReadOnlyTable<K: Key + 'static, V: Value + 'static> {
+    name: String,
+    tree: Btree<K, V>,
+    transaction_guard: Arc<TransactionGuard>,
+}
 
-impl<K: RedbKey + 'static, V: RedbValue + 'static> Debug for ReadOnlyTable<'_, K, V> {
+impl<K: Key + 'static, V: Value + 'static> ReadOnlyTable<K, V> {
+    pub(crate) fn new(
+        name: String,
+        root_page: Option<BtreeHeader>,
+        hint: PageHint,
+        guard: Arc<TransactionGuard>,
+        mem: Arc<TransactionalMemory>,
+    ) -> Result<ReadOnlyTable<K, V>> {
+        Ok(ReadOnlyTable {
+            name,
+            tree: Btree::new(root_page, hint, guard.clone(), mem)?,
+            transaction_guard: guard,
+        })
+    }
+
+    pub fn get<'a>(
+        &self,
+        key: impl Borrow<K::SelfType<'a>>,
+    ) -> Result<Option<AccessGuard<'static, V>>> {
+        self.tree.get(key.borrow())
+    }
+
+    /// This method is like [`ReadableTable::range()`], but the iterator is reference counted and keeps the transaction
+    /// alive until it is dropped.
+    pub fn range<'a, KR>(&self, range: impl RangeBounds<KR>) -> Result<Range<'static, K, V>>
+    where
+        KR: Borrow<K::SelfType<'a>>,
+    {
+        self.tree
+            .range(&range)
+            .map(|x| Range::new(x, self.transaction_guard.clone()))
+    }
+}
+
+impl<K: Key + 'static, V: Value + 'static> ReadableTableMetadata for ReadOnlyTable<K, V> {
+    fn stats(&self) -> Result<TableStats> {
+        let tree_stats = self.tree.stats()?;
+
+        Ok(TableStats {
+            tree_height: tree_stats.tree_height,
+            leaf_pages: tree_stats.leaf_pages,
+            branch_pages: tree_stats.branch_pages,
+            stored_leaf_bytes: tree_stats.stored_leaf_bytes,
+            metadata_bytes: tree_stats.metadata_bytes,
+            fragmented_bytes: tree_stats.fragmented_bytes,
+        })
+    }
+
+    fn len(&self) -> Result<u64> {
+        self.tree.len()
+    }
+}
+
+impl<K: Key + 'static, V: Value + 'static> ReadableTable<K, V> for ReadOnlyTable<K, V> {
+    fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> Result<Option<AccessGuard<V>>> {
+        self.tree.get(key.borrow())
+    }
+
+    fn range<'a, KR>(&self, range: impl RangeBounds<KR> + 'a) -> Result<Range<K, V>>
+    where
+        KR: Borrow<K::SelfType<'a>> + 'a,
+    {
+        self.tree
+            .range(&range)
+            .map(|x| Range::new(x, self.transaction_guard.clone()))
+    }
+}
+
+impl<K: Key, V: Value> Sealed for ReadOnlyTable<K, V> {}
+
+impl<K: Key + 'static, V: Value + 'static> Debug for ReadOnlyTable<K, V> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         debug_helper(f, &self.name, self.len(), self.first(), self.last())
     }
 }
 
-pub struct Drain<'a, K: RedbKey + 'static, V: RedbValue + 'static> {
-    inner: BtreeDrain<'a, K, V>,
-}
-
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> Drain<'a, K, V> {
-    fn new(inner: BtreeDrain<'a, K, V>) -> Self {
-        Self { inner }
-    }
-}
-
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> Iterator for Drain<'a, K, V> {
-    type Item = Result<(AccessGuard<'a, K>, AccessGuard<'a, V>)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let entry = self.inner.next()?;
-        Some(entry.map(|entry| {
-            let (page, key_range, value_range) = entry.into_raw();
-            let key = AccessGuard::with_page(page.clone(), key_range);
-            let value = AccessGuard::with_page(page, value_range);
-            (key, value)
-        }))
-    }
-}
-
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> DoubleEndedIterator for Drain<'a, K, V> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        let entry = self.inner.next_back()?;
-        Some(entry.map(|entry| {
-            let (page, key_range, value_range) = entry.into_raw();
-            let key = AccessGuard::with_page(page.clone(), key_range);
-            let value = AccessGuard::with_page(page, value_range);
-            (key, value)
-        }))
-    }
-}
-
-pub struct DrainFilter<
+pub struct ExtractIf<
     'a,
-    K: RedbKey + 'static,
-    V: RedbValue + 'static,
+    K: Key + 'static,
+    V: Value + 'static,
     F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
 > {
-    inner: BtreeDrainFilter<'a, K, V, F>,
+    inner: BtreeExtractIf<'a, K, V, F>,
 }
 
 impl<
         'a,
-        K: RedbKey + 'static,
-        V: RedbValue + 'static,
+        K: Key + 'static,
+        V: Value + 'static,
         F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
-    > DrainFilter<'a, K, V, F>
+    > ExtractIf<'a, K, V, F>
 {
-    fn new(inner: BtreeDrainFilter<'a, K, V, F>) -> Self {
+    fn new(inner: BtreeExtractIf<'a, K, V, F>) -> Self {
         Self { inner }
     }
 }
 
 impl<
         'a,
-        K: RedbKey + 'static,
-        V: RedbValue + 'static,
+        K: Key + 'static,
+        V: Value + 'static,
         F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
-    > Iterator for DrainFilter<'a, K, V, F>
+    > Iterator for ExtractIf<'a, K, V, F>
 {
     type Item = Result<(AccessGuard<'a, K>, AccessGuard<'a, V>)>;
 
@@ -552,10 +562,10 @@ impl<
 
 impl<
         'a,
-        K: RedbKey + 'static,
-        V: RedbValue + 'static,
+        K: Key + 'static,
+        V: Value + 'static,
         F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
-    > DoubleEndedIterator for DrainFilter<'a, K, V, F>
+    > DoubleEndedIterator for ExtractIf<'a, K, V, F>
 {
     fn next_back(&mut self) -> Option<Self::Item> {
         let entry = self.inner.next_back()?;
@@ -568,17 +578,25 @@ impl<
     }
 }
 
-pub struct Range<'a, K: RedbKey + 'static, V: RedbValue + 'static> {
-    inner: BtreeRangeIter<'a, K, V>,
+#[derive(Clone)]
+pub struct Range<'a, K: Key + 'static, V: Value + 'static> {
+    inner: BtreeRangeIter<K, V>,
+    _transaction_guard: Arc<TransactionGuard>,
+    // This lifetime is here so that `&` can be held on `Table` preventing concurrent mutation
+    _lifetime: PhantomData<&'a ()>,
 }
 
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> Range<'a, K, V> {
-    pub(super) fn new(inner: BtreeRangeIter<'a, K, V>) -> Self {
-        Self { inner }
+impl<'a, K: Key + 'static, V: Value + 'static> Range<'a, K, V> {
+    pub(super) fn new(inner: BtreeRangeIter<K, V>, guard: Arc<TransactionGuard>) -> Self {
+        Self {
+            inner,
+            _transaction_guard: guard,
+            _lifetime: Default::default(),
+        }
     }
 }
 
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> Iterator for Range<'a, K, V> {
+impl<'a, K: Key + 'static, V: Value + 'static> Iterator for Range<'a, K, V> {
     type Item = Result<(AccessGuard<'a, K>, AccessGuard<'a, V>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -593,7 +611,7 @@ impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> Iterator for Range<'a, K,
     }
 }
 
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> DoubleEndedIterator for Range<'a, K, V> {
+impl<'a, K: Key + 'static, V: Value + 'static> DoubleEndedIterator for Range<'a, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner.next_back().map(|x| {
             x.map(|entry| {

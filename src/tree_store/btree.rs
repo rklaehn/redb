@@ -1,21 +1,22 @@
+use crate::db::TransactionGuard;
 use crate::tree_store::btree_base::{
-    branch_checksum, leaf_checksum, BranchAccessor, BranchMutator, Checksum, LeafAccessor, BRANCH,
-    DEFERRED, LEAF,
+    branch_checksum, leaf_checksum, BranchAccessor, BranchMutator, BtreeHeader, Checksum,
+    LeafAccessor, BRANCH, DEFERRED, LEAF,
 };
-use crate::tree_store::btree_iters::BtreeDrain;
+use crate::tree_store::btree_iters::BtreeExtractIf;
 use crate::tree_store::btree_mutator::MutateHelper;
 use crate::tree_store::page_store::{CachePriority, Page, PageImpl, PageMut, TransactionalMemory};
 use crate::tree_store::{
-    AccessGuardMut, AllPageNumbersBtreeIter, BtreeDrainFilter, BtreeRangeIter, PageHint, PageNumber,
+    AccessGuardMut, AllPageNumbersBtreeIter, BtreeRangeIter, PageHint, PageNumber,
 };
-use crate::types::{MutInPlaceValue, RedbKey, RedbValue};
+use crate::types::{Key, MutInPlaceValue, Value};
 use crate::{AccessGuard, Result};
 #[cfg(feature = "logging")]
 use log::trace;
 use std::borrow::Borrow;
 use std::cmp::max;
 use std::marker::PhantomData;
-use std::ops::{RangeBounds, RangeFull};
+use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
 
 pub(crate) struct BtreeStats {
@@ -27,18 +28,18 @@ pub(crate) struct BtreeStats {
     pub(crate) fragmented_bytes: u64,
 }
 
-pub(crate) struct UntypedBtreeMut<'a> {
-    mem: &'a TransactionalMemory,
-    root: Option<(PageNumber, Checksum)>,
+pub(crate) struct UntypedBtreeMut {
+    mem: Arc<TransactionalMemory>,
+    root: Option<BtreeHeader>,
     freed_pages: Arc<Mutex<Vec<PageNumber>>>,
     key_width: Option<usize>,
     value_width: Option<usize>,
 }
 
-impl<'a> UntypedBtreeMut<'a> {
+impl UntypedBtreeMut {
     pub(crate) fn new(
-        root: Option<(PageNumber, Checksum)>,
-        mem: &'a TransactionalMemory,
+        root: Option<BtreeHeader>,
+        mem: Arc<TransactionalMemory>,
         freed_pages: Arc<Mutex<Vec<PageNumber>>>,
         key_width: Option<usize>,
         value_width: Option<usize>,
@@ -52,20 +53,25 @@ impl<'a> UntypedBtreeMut<'a> {
         }
     }
 
-    pub(crate) fn get_root(&self) -> Option<(PageNumber, Checksum)> {
+    pub(crate) fn get_root(&self) -> Option<BtreeHeader> {
         self.root
     }
 
     // Recomputes the checksum for all pages that are uncommitted
     pub(crate) fn finalize_dirty_checksums(&mut self) -> Result {
         let mut root = self.root;
-        if let Some((ref page_number, ref mut checksum)) = root {
-            if !self.mem.uncommitted(*page_number) {
+        if let Some(BtreeHeader {
+            root: ref p,
+            ref mut checksum,
+            length: _,
+        }) = root
+        {
+            if !self.mem.uncommitted(*p) {
                 // root page is clean
                 return Ok(());
             }
 
-            *checksum = self.finalize_dirty_checksums_helper(*page_number)?;
+            *checksum = self.finalize_dirty_checksums_helper(*p)?;
             self.root = root;
         }
 
@@ -111,20 +117,20 @@ impl<'a> UntypedBtreeMut<'a> {
     where
         F: Fn(PageMut) -> Result,
     {
-        if let Some((ref page_number, _)) = self.root {
-            if !self.mem.uncommitted(*page_number) {
+        if let Some(page_number) = self.root.map(|x| x.root) {
+            if !self.mem.uncommitted(page_number) {
                 // root page is clean
                 return Ok(());
             }
 
-            let page = self.mem.get_page_mut(*page_number)?;
+            let page = self.mem.get_page_mut(page_number)?;
             match page.memory()[0] {
                 LEAF => {
                     visitor(page)?;
                 }
                 BRANCH => {
                     drop(page);
-                    self.dirty_leaf_visitor_helper(*page_number, &visitor)?;
+                    self.dirty_leaf_visitor_helper(page_number, &visitor)?;
                 }
                 _ => unreachable!(),
             }
@@ -162,8 +168,8 @@ impl<'a> UntypedBtreeMut<'a> {
     // Relocate the btree to lower pages
     pub(crate) fn relocate(&mut self) -> Result<bool> {
         if let Some(root) = self.get_root() {
-            if let Some(new_root) = self.relocate_helper(root.0)? {
-                self.root = Some(new_root);
+            if let Some((new_root, new_checksum)) = self.relocate_helper(root.root)? {
+                self.root = Some(BtreeHeader::new(new_root, new_checksum, root.length));
                 return Ok(true);
             }
         }
@@ -216,26 +222,31 @@ impl<'a> UntypedBtreeMut<'a> {
     }
 }
 
-pub(crate) struct BtreeMut<'a, K: RedbKey, V: RedbValue> {
-    mem: &'a TransactionalMemory,
-    root: Arc<Mutex<Option<(PageNumber, Checksum)>>>,
+pub(crate) struct BtreeMut<'a, K: Key + 'static, V: Value + 'static> {
+    mem: Arc<TransactionalMemory>,
+    transaction_guard: Arc<TransactionGuard>,
+    root: Option<BtreeHeader>,
     freed_pages: Arc<Mutex<Vec<PageNumber>>>,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
+    _lifetime: PhantomData<&'a ()>,
 }
 
-impl<'a, K: RedbKey + 'a, V: RedbValue + 'a> BtreeMut<'a, K, V> {
+impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
     pub(crate) fn new(
-        root: Option<(PageNumber, Checksum)>,
-        mem: &'a TransactionalMemory,
+        root: Option<BtreeHeader>,
+        guard: Arc<TransactionGuard>,
+        mem: Arc<TransactionalMemory>,
         freed_pages: Arc<Mutex<Vec<PageNumber>>>,
     ) -> Self {
         Self {
             mem,
-            root: Arc::new(Mutex::new(root)),
+            transaction_guard: guard,
+            root,
             freed_pages,
             _key_type: Default::default(),
             _value_type: Default::default(),
+            _lifetime: Default::default(),
         }
     }
 
@@ -244,7 +255,7 @@ impl<'a, K: RedbKey + 'a, V: RedbValue + 'a> BtreeMut<'a, K, V> {
             self.get_root(),
             K::fixed_width(),
             V::fixed_width(),
-            self.mem,
+            self.mem.clone(),
         )
         .verify_checksum()
     }
@@ -252,43 +263,43 @@ impl<'a, K: RedbKey + 'a, V: RedbValue + 'a> BtreeMut<'a, K, V> {
     pub(crate) fn finalize_dirty_checksums(&mut self) -> Result {
         let mut tree = UntypedBtreeMut::new(
             self.get_root(),
-            self.mem,
+            self.mem.clone(),
             self.freed_pages.clone(),
             K::fixed_width(),
             V::fixed_width(),
         );
         tree.finalize_dirty_checksums()?;
-        *self.root.lock().unwrap() = tree.get_root();
+        self.root = tree.get_root();
         Ok(())
     }
 
     pub(crate) fn all_pages_iter(&self) -> Result<Option<AllPageNumbersBtreeIter>> {
-        if let Some((root, _)) = *self.root.lock().unwrap() {
+        if let Some(root) = self.root.map(|x| x.root) {
             Ok(Some(AllPageNumbersBtreeIter::new(
                 root,
                 K::fixed_width(),
                 V::fixed_width(),
-                self.mem,
+                self.mem.clone(),
             )?))
         } else {
             Ok(None)
         }
     }
 
-    pub(crate) fn get_root(&self) -> Option<(PageNumber, Checksum)> {
-        *(*self.root).lock().unwrap()
+    pub(crate) fn get_root(&self) -> Option<BtreeHeader> {
+        self.root
     }
 
     pub(crate) fn relocate(&mut self) -> Result<bool> {
         let mut tree = UntypedBtreeMut::new(
             self.get_root(),
-            self.mem,
+            self.mem.clone(),
             self.freed_pages.clone(),
             K::fixed_width(),
             V::fixed_width(),
         );
         if tree.relocate()? {
-            *self.root.lock().unwrap() = tree.get_root();
+            self.root = tree.get_root();
             Ok(true)
         } else {
             Ok(false)
@@ -308,9 +319,8 @@ impl<'a, K: RedbKey + 'a, V: RedbValue + 'a> BtreeMut<'a, K, V> {
             V::as_bytes(value).as_ref().len()
         );
         let mut freed_pages = self.freed_pages.lock().unwrap();
-        let mut root = self.root.lock().unwrap();
         let mut operation: MutateHelper<'_, '_, K, V> =
-            MutateHelper::new(&mut root, self.mem, freed_pages.as_mut());
+            MutateHelper::new(&mut self.root, self.mem.clone(), freed_pages.as_mut());
         let (old_value, _) = operation.insert(key, value)?;
         Ok(old_value)
     }
@@ -318,10 +328,9 @@ impl<'a, K: RedbKey + 'a, V: RedbValue + 'a> BtreeMut<'a, K, V> {
     pub(crate) fn remove(&mut self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<V>>> {
         #[cfg(feature = "logging")]
         trace!("Btree(root={:?}): Deleting {:?}", &self.root, key);
-        let mut root = self.root.lock().unwrap();
         let mut freed_pages = self.freed_pages.lock().unwrap();
         let mut operation: MutateHelper<'_, '_, K, V> =
-            MutateHelper::new(&mut root, self.mem, freed_pages.as_mut());
+            MutateHelper::new(&mut self.root, self.mem.clone(), freed_pages.as_mut());
         let result = operation.delete(key)?;
         Ok(result)
     }
@@ -333,15 +342,20 @@ impl<'a, K: RedbKey + 'a, V: RedbValue + 'a> BtreeMut<'a, K, V> {
 
     pub(crate) fn stats(&self) -> Result<BtreeStats> {
         btree_stats(
-            self.get_root().map(|(p, _)| p),
-            self.mem,
+            self.get_root().map(|x| x.root),
+            &self.mem,
             K::fixed_width(),
             V::fixed_width(),
         )
     }
 
-    fn read_tree(&self) -> Result<Btree<'a, K, V>> {
-        Btree::new(self.get_root(), PageHint::None, self.mem)
+    fn read_tree(&self) -> Result<Btree<K, V>> {
+        Btree::new(
+            self.get_root(),
+            PageHint::None,
+            self.transaction_guard.clone(),
+            self.mem.clone(),
+        )
     }
 
     pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'_, V>>> {
@@ -351,77 +365,61 @@ impl<'a, K: RedbKey + 'a, V: RedbValue + 'a> BtreeMut<'a, K, V> {
     pub(crate) fn range<'a0, T: RangeBounds<KR> + 'a0, KR: Borrow<K::SelfType<'a0>> + 'a0>(
         &self,
         range: &'_ T,
-    ) -> Result<BtreeRangeIter<'a, K, V>>
+    ) -> Result<BtreeRangeIter<K, V>>
     where
         K: 'a0,
     {
         self.read_tree()?.range(range)
     }
 
-    pub(crate) fn drain<'a0, T: RangeBounds<KR> + 'a0, KR: Borrow<K::SelfType<'a0>> + 'a0>(
-        &mut self,
+    pub(crate) fn extract_from_if<
+        'a,
+        'a0,
+        T: RangeBounds<KR> + 'a0,
+        KR: Borrow<K::SelfType<'a0>> + 'a0,
+        F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
+    >(
+        &'a mut self,
         range: &'_ T,
-    ) -> Result<BtreeDrain<'a, K, V>>
+        predicate: F,
+    ) -> Result<BtreeExtractIf<'a, K, V, F>>
     where
         K: 'a0,
     {
         let iter = self.range(range)?;
-        let return_iter = self.range(range)?;
-        let mut free_on_drop = vec![];
-        let mut root = self.root.lock().unwrap();
-        let mut operation: MutateHelper<'_, '_, K, V> =
-            MutateHelper::new_do_not_modify(&mut root, self.mem, &mut free_on_drop);
-        for entry in iter {
-            // TODO: optimize so that we don't have to call delete in a loop
-            assert!(operation.delete(&entry?.key())?.is_some());
-        }
 
-        let result = BtreeDrain::new(
-            return_iter,
-            free_on_drop,
+        let result = BtreeExtractIf::new(
+            &mut self.root,
+            iter,
+            predicate,
             self.freed_pages.clone(),
-            self.mem,
+            self.mem.clone(),
         );
 
         Ok(result)
     }
 
-    pub(crate) fn drain_filter<
-        'a0,
-        T: RangeBounds<KR> + 'a0,
-        KR: Borrow<K::SelfType<'a0>> + 'a0,
-        F: for<'f> Fn(K::SelfType<'f>, V::SelfType<'f>) -> bool,
-    >(
+    pub(crate) fn retain_in<'a, KR, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>(
         &mut self,
-        range: &'_ T,
-        predicate: F,
-    ) -> Result<BtreeDrainFilter<'a, K, V, F>>
+        mut predicate: F,
+        range: impl RangeBounds<KR> + 'a,
+    ) -> Result
     where
-        K: 'a0,
+        KR: Borrow<K::SelfType<'a>> + 'a,
     {
-        let iter = self.range(range)?;
-        let return_iter = self.range(range)?;
-        let mut free_on_drop = vec![];
-        let mut root = self.root.lock().unwrap();
+        let iter = self.range(&range)?;
+        let mut freed = vec![];
         let mut operation: MutateHelper<'_, '_, K, V> =
-            MutateHelper::new_do_not_modify(&mut root, self.mem, &mut free_on_drop);
+            MutateHelper::new_do_not_modify(&mut self.root, self.mem.clone(), &mut freed);
         for entry in iter {
-            // TODO: optimize so that we don't have to call delete in a loop
             let entry = entry?;
-            if predicate(entry.key(), entry.value()) {
+            if !predicate(entry.key(), entry.value()) {
                 assert!(operation.delete(&entry.key())?.is_some());
             }
         }
+        self.freed_pages.lock().unwrap().extend_from_slice(&freed);
 
-        let result = BtreeDrainFilter::new(
-            return_iter,
-            predicate,
-            free_on_drop,
-            self.freed_pages.clone(),
-            self.mem,
-        );
-
-        Ok(result)
+        Ok(())
     }
 
     pub(crate) fn len(&self) -> Result<u64> {
@@ -429,7 +427,7 @@ impl<'a, K: RedbKey + 'a, V: RedbValue + 'a> BtreeMut<'a, K, V> {
     }
 }
 
-impl<'a, K: RedbKey + 'a, V: MutInPlaceValue + 'a> BtreeMut<'a, K, V> {
+impl<'a, K: Key + 'a, V: MutInPlaceValue + 'a> BtreeMut<'a, K, V> {
     /// Reserve space to insert a key-value pair
     /// The returned reference will have length equal to value_length
     // Return type has the same lifetime as &self, because the tree must not be modified until the mutable guard is dropped
@@ -445,30 +443,29 @@ impl<'a, K: RedbKey + 'a, V: MutInPlaceValue + 'a> BtreeMut<'a, K, V> {
             key,
             value_length
         );
-        let mut root = self.root.lock().unwrap();
         let mut freed_pages = self.freed_pages.lock().unwrap();
         let mut value = vec![0u8; value_length as usize];
         V::initialize(&mut value);
-        let mut operation = MutateHelper::<K, V>::new(&mut root, self.mem, freed_pages.as_mut());
+        let mut operation =
+            MutateHelper::<K, V>::new(&mut self.root, self.mem.clone(), freed_pages.as_mut());
         let (_, guard) = operation.insert(key, &V::from_bytes(&value))?;
-        drop(root);
         Ok(guard)
     }
 }
 
-pub(crate) struct RawBtree<'a> {
-    mem: &'a TransactionalMemory,
-    root: Option<(PageNumber, Checksum)>,
+pub(crate) struct RawBtree {
+    mem: Arc<TransactionalMemory>,
+    root: Option<BtreeHeader>,
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
 }
 
-impl<'a> RawBtree<'a> {
+impl RawBtree {
     pub(crate) fn new(
-        root: Option<(PageNumber, Checksum)>,
+        root: Option<BtreeHeader>,
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
-        mem: &'a TransactionalMemory,
+        mem: Arc<TransactionalMemory>,
     ) -> Self {
         Self {
             mem,
@@ -478,22 +475,26 @@ impl<'a> RawBtree<'a> {
         }
     }
 
-    pub(crate) fn get_root(&self) -> Option<(PageNumber, Checksum)> {
+    pub(crate) fn get_root(&self) -> Option<BtreeHeader> {
         self.root
     }
 
     pub(crate) fn stats(&self) -> Result<BtreeStats> {
         btree_stats(
-            self.root.map(|(p, _)| p),
-            self.mem,
+            self.root.map(|x| x.root),
+            &self.mem,
             self.fixed_key_size,
             self.fixed_value_size,
         )
     }
 
+    pub(crate) fn len(&self) -> Result<u64> {
+        Ok(self.root.map(|x| x.length).unwrap_or(0))
+    }
+
     pub(crate) fn verify_checksum(&self) -> Result<bool> {
-        if let Some((root, checksum)) = self.root {
-            self.verify_checksum_helper(root, checksum)
+        if let Some(header) = self.root {
+            self.verify_checksum_helper(header.root, header.checksum)
         } else {
             Ok(true)
         }
@@ -540,29 +541,32 @@ impl<'a> RawBtree<'a> {
     }
 }
 
-pub(crate) struct Btree<'a, K: RedbKey, V: RedbValue> {
-    mem: &'a TransactionalMemory,
+pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
+    mem: Arc<TransactionalMemory>,
+    _transaction_guard: Arc<TransactionGuard>,
     // Cache of the root page to avoid repeated lookups
-    cached_root: Option<PageImpl<'a>>,
-    root: Option<(PageNumber, Checksum)>,
+    cached_root: Option<PageImpl>,
+    root: Option<BtreeHeader>,
     hint: PageHint,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
 }
 
-impl<'a, K: RedbKey, V: RedbValue> Btree<'a, K, V> {
+impl<K: Key, V: Value> Btree<K, V> {
     pub(crate) fn new(
-        root: Option<(PageNumber, Checksum)>,
+        root: Option<BtreeHeader>,
         hint: PageHint,
-        mem: &'a TransactionalMemory,
+        guard: Arc<TransactionGuard>,
+        mem: Arc<TransactionalMemory>,
     ) -> Result<Self> {
-        let cached_root = if let Some((r, _)) = root {
-            Some(mem.get_page_extended(r, hint)?)
+        let cached_root = if let Some(header) = root {
+            Some(mem.get_page_extended(header.root, hint)?)
         } else {
             None
         };
         Ok(Self {
             mem,
+            _transaction_guard: guard,
             cached_root,
             root,
             hint,
@@ -571,11 +575,11 @@ impl<'a, K: RedbKey, V: RedbValue> Btree<'a, K, V> {
         })
     }
 
-    pub(crate) fn get_root(&self) -> Option<(PageNumber, Checksum)> {
+    pub(crate) fn get_root(&self) -> Option<BtreeHeader> {
         self.root
     }
 
-    pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'a, V>>> {
+    pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'static, V>>> {
         if let Some(ref root_page) = self.cached_root {
             self.get_helper(root_page.clone(), K::as_bytes(key).as_ref())
         } else {
@@ -584,15 +588,14 @@ impl<'a, K: RedbKey, V: RedbValue> Btree<'a, K, V> {
     }
 
     // Returns the value for the queried key, if present
-    fn get_helper(&self, page: PageImpl<'a>, query: &[u8]) -> Result<Option<AccessGuard<'a, V>>> {
+    fn get_helper(&self, page: PageImpl, query: &[u8]) -> Result<Option<AccessGuard<'static, V>>> {
         let node_mem = page.memory();
         match node_mem[0] {
             LEAF => {
                 let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
                 if let Some(entry_index) = accessor.find_key::<K>(query) {
                     let (start, end) = accessor.value_range(entry_index).unwrap();
-                    // Safety: free_on_drop is false
-                    let guard = AccessGuard::new(page, start, end - start, false, self.mem);
+                    let guard = AccessGuard::with_page(page, start..end);
                     Ok(Some(guard))
                 } else {
                     Ok(None)
@@ -607,34 +610,21 @@ impl<'a, K: RedbKey, V: RedbValue> Btree<'a, K, V> {
         }
     }
 
-    pub(crate) fn range<'a0, T: RangeBounds<KR> + 'a0, KR: Borrow<K::SelfType<'a0>> + 'a0>(
+    pub(crate) fn range<'a0, T: RangeBounds<KR>, KR: Borrow<K::SelfType<'a0>>>(
         &self,
         range: &'_ T,
-    ) -> Result<BtreeRangeIter<'a, K, V>>
-    where
-        K: 'a0,
-    {
-        BtreeRangeIter::new(range, self.root.map(|(p, _)| p), self.mem)
+    ) -> Result<BtreeRangeIter<K, V>> {
+        BtreeRangeIter::new(range, self.root.map(|x| x.root), self.mem.clone())
     }
 
     pub(crate) fn len(&self) -> Result<u64> {
-        let iter: BtreeRangeIter<K, V> = BtreeRangeIter::new::<RangeFull, K::SelfType<'_>>(
-            &(..),
-            self.root.map(|(p, _)| p),
-            self.mem,
-        )?;
-        let mut count = 0;
-        for v in iter {
-            v?;
-            count += 1;
-        }
-        Ok(count)
+        Ok(self.root.map(|x| x.length).unwrap_or(0))
     }
 
     pub(crate) fn stats(&self) -> Result<BtreeStats> {
         btree_stats(
-            self.root.map(|(p, _)| p),
-            self.mem,
+            self.root.map(|x| x.root),
+            &self.mem,
             K::fixed_width(),
             V::fixed_width(),
         )
@@ -642,7 +632,7 @@ impl<'a, K: RedbKey, V: RedbValue> Btree<'a, K, V> {
 
     #[allow(dead_code)]
     pub(crate) fn print_debug(&self, include_values: bool) -> Result {
-        if let Some((p, _)) = self.root {
+        if let Some(p) = self.root.map(|x| x.root) {
             let mut pages = vec![self.mem.get_page(p)?];
             while !pages.is_empty() {
                 let mut next_children = vec![];

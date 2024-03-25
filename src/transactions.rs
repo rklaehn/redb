@@ -1,24 +1,27 @@
+use crate::db::TransactionGuard;
 use crate::error::CommitError;
 use crate::multimap_table::ReadOnlyUntypedMultimapTable;
 use crate::sealed::Sealed;
 use crate::table::ReadOnlyUntypedTable;
 use crate::transaction_tracker::{SavepointId, TransactionId, TransactionTracker};
 use crate::tree_store::{
-    Btree, BtreeMut, Checksum, FreedPageList, FreedTableKey, InternalTableDefinition, PageHint,
-    PageNumber, SerializedSavepoint, TableTree, TableType, TransactionalMemory, MAX_VALUE_LENGTH,
+    Btree, BtreeHeader, BtreeMut, FreedPageList, FreedTableKey, InternalTableDefinition, PageHint,
+    PageNumber, SerializedSavepoint, TableTree, TableTreeMut, TableType, TransactionalMemory,
+    MAX_VALUE_LENGTH,
 };
-use crate::types::{RedbKey, RedbValue};
+use crate::types::{Key, Value};
 use crate::{
-    AccessGuard, Database, MultimapTable, MultimapTableDefinition, MultimapTableHandle, Range,
+    AccessGuard, MultimapTable, MultimapTableDefinition, MultimapTableHandle, Range,
     ReadOnlyMultimapTable, ReadOnlyTable, Result, Savepoint, SavepointError, StorageError, Table,
-    TableDefinition, TableError, TableHandle, UntypedMultimapTableHandle, UntypedTableHandle,
+    TableDefinition, TableError, TableHandle, TransactionError, UntypedMultimapTableHandle,
+    UntypedTableHandle,
 };
 #[cfg(feature = "logging")]
 use log::{info, warn};
 use std::borrow::Borrow;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::ops::{RangeBounds, RangeFull};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,13 +33,13 @@ const NEXT_SAVEPOINT_TABLE: SystemTableDefinition<(), SavepointId> =
 pub(crate) const SAVEPOINT_TABLE: SystemTableDefinition<SavepointId, SerializedSavepoint> =
     SystemTableDefinition::new("persistent_savepoints");
 
-pub struct SystemTableDefinition<'a, K: RedbKey + 'static, V: RedbValue + 'static> {
+pub struct SystemTableDefinition<'a, K: Key + 'static, V: Value + 'static> {
     name: &'a str,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
 }
 
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> SystemTableDefinition<'a, K, V> {
+impl<'a, K: Key + 'static, V: Value + 'static> SystemTableDefinition<'a, K, V> {
     pub const fn new(name: &'a str) -> Self {
         assert!(!name.is_empty());
         Self {
@@ -47,25 +50,23 @@ impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> SystemTableDefinition<'a,
     }
 }
 
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> TableHandle
-    for SystemTableDefinition<'a, K, V>
-{
+impl<'a, K: Key + 'static, V: Value + 'static> TableHandle for SystemTableDefinition<'a, K, V> {
     fn name(&self) -> &str {
         self.name
     }
 }
 
-impl<K: RedbKey, V: RedbValue> Sealed for SystemTableDefinition<'_, K, V> {}
+impl<K: Key, V: Value> Sealed for SystemTableDefinition<'_, K, V> {}
 
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> Clone for SystemTableDefinition<'a, K, V> {
+impl<'a, K: Key + 'static, V: Value + 'static> Clone for SystemTableDefinition<'a, K, V> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> Copy for SystemTableDefinition<'a, K, V> {}
+impl<'a, K: Key + 'static, V: Value + 'static> Copy for SystemTableDefinition<'a, K, V> {}
 
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> Display for SystemTableDefinition<'a, K, V> {
+impl<'a, K: Key + 'static, V: Value + 'static> Display for SystemTableDefinition<'a, K, V> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -189,24 +190,27 @@ pub enum Durability {
 }
 
 // Like a Table but only one may be open at a time to avoid possible races
-pub struct SystemTable<'db, 's, K: RedbKey + 'static, V: RedbValue + 'static> {
+pub struct SystemTable<'db, 's, K: Key + 'static, V: Value + 'static> {
     name: String,
     namespace: &'s mut SystemNamespace<'db>,
     tree: BtreeMut<'s, K, V>,
+    transaction_guard: Arc<TransactionGuard>,
 }
 
-impl<'db, 's, K: RedbKey + 'static, V: RedbValue + 'static> SystemTable<'db, 's, K, V> {
+impl<'db, 's, K: Key + 'static, V: Value + 'static> SystemTable<'db, 's, K, V> {
     fn new(
         name: &str,
-        table_root: Option<(PageNumber, Checksum)>,
+        table_root: Option<BtreeHeader>,
         freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-        mem: &'db TransactionalMemory,
+        guard: Arc<TransactionGuard>,
+        mem: Arc<TransactionalMemory>,
         namespace: &'s mut SystemNamespace<'db>,
     ) -> SystemTable<'db, 's, K, V> {
         SystemTable {
             name: name.to_string(),
             namespace,
-            tree: BtreeMut::new(table_root, mem, freed_pages),
+            tree: BtreeMut::new(table_root, guard.clone(), mem, freed_pages),
+            transaction_guard: guard,
         }
     }
 
@@ -222,7 +226,9 @@ impl<'db, 's, K: RedbKey + 'static, V: RedbValue + 'static> SystemTable<'db, 's,
         K: 'a,
         KR: Borrow<K::SelfType<'a>> + 'a,
     {
-        self.tree.range(&range).map(Range::new)
+        self.tree
+            .range(&range)
+            .map(|x| Range::new(x, self.transaction_guard.clone()))
     }
 
     pub fn insert<'k, 'v>(
@@ -252,20 +258,25 @@ impl<'db, 's, K: RedbKey + 'static, V: RedbValue + 'static> SystemTable<'db, 's,
     }
 }
 
-impl<'db, 's, K: RedbKey + 'static, V: RedbValue + 'static> Drop for SystemTable<'db, 's, K, V> {
+impl<'db, 's, K: Key + 'static, V: Value + 'static> Drop for SystemTable<'db, 's, K, V> {
     fn drop(&mut self) {
-        self.namespace.close_table(&self.name, &self.tree);
+        self.namespace.close_table(
+            &self.name,
+            &self.tree,
+            self.tree.get_root().map(|x| x.length).unwrap_or_default(),
+        );
     }
 }
 
 struct SystemNamespace<'db> {
-    table_tree: TableTree<'db>,
+    table_tree: TableTreeMut<'db>,
+    transaction_guard: Arc<TransactionGuard>,
 }
 
 impl<'db> SystemNamespace<'db> {
-    fn open_system_table<'txn, 's, K: RedbKey + 'static, V: RedbValue + 'static>(
+    fn open_system_table<'txn, 's, K: Key + 'static, V: Value + 'static>(
         &'s mut self,
-        transaction: &'txn WriteTransaction<'db>,
+        transaction: &'txn WriteTransaction,
         definition: SystemTableDefinition<K, V>,
     ) -> Result<SystemTable<'db, 's, K, V>> {
         #[cfg(feature = "logging")]
@@ -282,33 +293,35 @@ impl<'db> SystemNamespace<'db> {
             definition.name(),
             root.get_root(),
             transaction.freed_pages.clone(),
-            transaction.mem,
+            self.transaction_guard.clone(),
+            transaction.mem.clone(),
             self,
         ))
     }
 
-    fn close_table<K: RedbKey + 'static, V: RedbValue + 'static>(
+    fn close_table<K: Key + 'static, V: Value + 'static>(
         &mut self,
         name: &str,
         table: &BtreeMut<K, V>,
+        length: u64,
     ) {
         self.table_tree
-            .stage_update_table_root(name, table.get_root());
+            .stage_update_table_root(name, table.get_root(), length);
     }
 }
 
 struct TableNamespace<'db> {
     open_tables: HashMap<String, &'static panic::Location<'static>>,
-    table_tree: TableTree<'db>,
+    table_tree: TableTreeMut<'db>,
 }
 
 impl<'db> TableNamespace<'db> {
     #[track_caller]
-    fn inner_open<K: RedbKey + 'static, V: RedbValue + 'static>(
+    fn inner_open<K: Key + 'static, V: Value + 'static>(
         &mut self,
         name: &str,
         table_type: TableType,
-    ) -> Result<Option<(PageNumber, Checksum)>, TableError> {
+    ) -> Result<(Option<BtreeHeader>, u64), TableError> {
         if let Some(location) = self.open_tables.get(name) {
             return Err(TableError::TableAlreadyOpen(name.to_string(), location));
         }
@@ -319,45 +332,46 @@ impl<'db> TableNamespace<'db> {
         self.open_tables
             .insert(name.to_string(), panic::Location::caller());
 
-        Ok(internal_table.get_root())
+        Ok((internal_table.get_root(), internal_table.get_length()))
     }
 
     #[track_caller]
-    pub fn open_multimap_table<'txn, K: RedbKey + 'static, V: RedbKey + 'static>(
+    pub fn open_multimap_table<'txn, K: Key + 'static, V: Key + 'static>(
         &mut self,
-        transaction: &'txn WriteTransaction<'db>,
+        transaction: &'txn WriteTransaction,
         definition: MultimapTableDefinition<K, V>,
-    ) -> Result<MultimapTable<'db, 'txn, K, V>, TableError> {
+    ) -> Result<MultimapTable<'txn, K, V>, TableError> {
         #[cfg(feature = "logging")]
         info!("Opening multimap table: {}", definition);
-        let root = self.inner_open::<K, V>(definition.name(), TableType::Multimap)?;
+        let (root, length) = self.inner_open::<K, V>(definition.name(), TableType::Multimap)?;
         transaction.dirty.store(true, Ordering::Release);
 
         Ok(MultimapTable::new(
             definition.name(),
             root,
+            length,
             transaction.freed_pages.clone(),
-            transaction.mem,
+            transaction.mem.clone(),
             transaction,
         ))
     }
 
     #[track_caller]
-    pub fn open_table<'txn, K: RedbKey + 'static, V: RedbValue + 'static>(
+    pub fn open_table<'txn, K: Key + 'static, V: Value + 'static>(
         &mut self,
-        transaction: &'txn WriteTransaction<'db>,
+        transaction: &'txn WriteTransaction,
         definition: TableDefinition<K, V>,
-    ) -> Result<Table<'db, 'txn, K, V>, TableError> {
+    ) -> Result<Table<'txn, K, V>, TableError> {
         #[cfg(feature = "logging")]
         info!("Opening table: {}", definition);
-        let root = self.inner_open::<K, V>(definition.name(), TableType::Normal)?;
+        let (root, _) = self.inner_open::<K, V>(definition.name(), TableType::Normal)?;
         transaction.dirty.store(true, Ordering::Release);
 
         Ok(Table::new(
             definition.name(),
             root,
             transaction.freed_pages.clone(),
-            transaction.mem,
+            transaction.mem.clone(),
             transaction,
         ))
     }
@@ -374,7 +388,7 @@ impl<'db> TableNamespace<'db> {
     #[track_caller]
     fn delete_table<'txn>(
         &mut self,
-        transaction: &'txn WriteTransaction<'db>,
+        transaction: &'txn WriteTransaction,
         name: &str,
     ) -> Result<bool, TableError> {
         #[cfg(feature = "logging")]
@@ -386,7 +400,7 @@ impl<'db> TableNamespace<'db> {
     #[track_caller]
     fn delete_multimap_table<'txn>(
         &mut self,
-        transaction: &'txn WriteTransaction<'db>,
+        transaction: &'txn WriteTransaction,
         name: &str,
     ) -> Result<bool, TableError> {
         #[cfg(feature = "logging")]
@@ -395,34 +409,35 @@ impl<'db> TableNamespace<'db> {
         self.inner_delete(name, TableType::Multimap)
     }
 
-    pub(crate) fn close_table<K: RedbKey + 'static, V: RedbValue + 'static>(
+    pub(crate) fn close_table<K: Key + 'static, V: Value + 'static>(
         &mut self,
         name: &str,
         table: &BtreeMut<K, V>,
+        length: u64,
     ) {
         self.open_tables.remove(name).unwrap();
         self.table_tree
-            .stage_update_table_root(name, table.get_root());
+            .stage_update_table_root(name, table.get_root(), length);
     }
 }
 
 /// A read/write transaction
 ///
 /// Only a single [`WriteTransaction`] may exist at a time
-pub struct WriteTransaction<'db> {
-    db: &'db Database,
-    transaction_tracker: Arc<Mutex<TransactionTracker>>,
-    mem: &'db TransactionalMemory,
+pub struct WriteTransaction {
+    transaction_tracker: Arc<TransactionTracker>,
+    mem: Arc<TransactionalMemory>,
+    transaction_guard: Arc<TransactionGuard>,
     transaction_id: TransactionId,
     // The table of freed pages by transaction. FreedTableKey -> binary.
     // The binary blob is a length-prefixed array of PageNumber
-    freed_tree: Mutex<BtreeMut<'db, FreedTableKey, FreedPageList<'static>>>,
+    freed_tree: Mutex<BtreeMut<'static, FreedTableKey, FreedPageList<'static>>>,
     freed_pages: Arc<Mutex<Vec<PageNumber>>>,
     // Pages that were freed from the freed-tree. These can be freed immediately after commit(),
     // since read transactions do not access the freed-tree
     post_commit_frees: Arc<Mutex<Vec<PageNumber>>>,
-    tables: Mutex<TableNamespace<'db>>,
-    system_tables: Mutex<SystemNamespace<'db>>,
+    tables: Mutex<TableNamespace<'static>>,
+    system_tables: Mutex<SystemNamespace<'static>>,
     completed: bool,
     dirty: AtomicBool,
     durability: Durability,
@@ -431,37 +446,51 @@ pub struct WriteTransaction<'db> {
     deleted_persistent_savepoints: Mutex<Vec<(SavepointId, TransactionId)>>,
 }
 
-impl<'db> WriteTransaction<'db> {
+impl WriteTransaction {
     pub(crate) fn new(
-        db: &'db Database,
-        transaction_tracker: Arc<Mutex<TransactionTracker>>,
+        guard: TransactionGuard,
+        transaction_tracker: Arc<TransactionTracker>,
+        mem: Arc<TransactionalMemory>,
     ) -> Result<Self> {
-        let transaction_id = db.start_write_transaction();
+        let transaction_id = guard.id();
+        let guard = Arc::new(guard);
 
-        let root_page = db.get_memory().get_data_root();
-        let system_page = db.get_memory().get_system_root();
-        let freed_root = db.get_memory().get_freed_root();
+        let root_page = mem.get_data_root();
+        let system_page = mem.get_system_root();
+        let freed_root = mem.get_freed_root();
         let freed_pages = Arc::new(Mutex::new(vec![]));
         let post_commit_frees = Arc::new(Mutex::new(vec![]));
 
         let tables = TableNamespace {
             open_tables: Default::default(),
-            table_tree: TableTree::new(root_page, db.get_memory(), freed_pages.clone()),
+            table_tree: TableTreeMut::new(
+                root_page,
+                guard.clone(),
+                mem.clone(),
+                freed_pages.clone(),
+            ),
         };
         let system_tables = SystemNamespace {
-            table_tree: TableTree::new(system_page, db.get_memory(), freed_pages.clone()),
+            table_tree: TableTreeMut::new(
+                system_page,
+                guard.clone(),
+                mem.clone(),
+                freed_pages.clone(),
+            ),
+            transaction_guard: guard.clone(),
         };
 
         Ok(Self {
-            db,
             transaction_tracker,
-            mem: db.get_memory(),
+            mem: mem.clone(),
+            transaction_guard: guard.clone(),
             transaction_id,
             tables: Mutex::new(tables),
             system_tables: Mutex::new(system_tables),
             freed_tree: Mutex::new(BtreeMut::new(
                 freed_root,
-                db.get_memory(),
+                guard,
+                mem,
                 post_commit_frees.clone(),
             )),
             freed_pages,
@@ -512,6 +541,10 @@ impl<'db> WriteTransaction<'db> {
             .insert(savepoint.get_id());
 
         Ok(savepoint.get_id().0)
+    }
+
+    pub(crate) fn transaction_guard(&self) -> Arc<TransactionGuard> {
+        self.transaction_guard.clone()
     }
 
     pub(crate) fn next_persistent_savepoint_id(&self) -> Result<Option<SavepointId>> {
@@ -577,6 +610,23 @@ impl<'db> WriteTransaction<'db> {
         Ok(savepoints.into_iter())
     }
 
+    // TODO: deduplicate this with the one in Database
+    fn allocate_read_transaction(&self) -> Result<TransactionGuard> {
+        let id = self
+            .transaction_tracker
+            .register_read_transaction(&self.mem)?;
+
+        Ok(TransactionGuard::new_read(
+            id,
+            self.transaction_tracker.clone(),
+        ))
+    }
+
+    fn allocate_savepoint(&self) -> Result<(SavepointId, TransactionId)> {
+        let id = self.transaction_tracker.allocate_savepoint();
+        Ok((id, self.allocate_read_transaction()?.leak()))
+    }
+
     /// Creates a snapshot of the current database state, which can be used to rollback the database
     ///
     /// This savepoint will be freed as soon as the returned `[Savepoint]` is dropped.
@@ -587,7 +637,7 @@ impl<'db> WriteTransaction<'db> {
             return Err(SavepointError::InvalidSavepoint);
         }
 
-        let (id, transaction_id) = self.db.allocate_savepoint()?;
+        let (id, transaction_id) = self.allocate_savepoint()?;
         #[cfg(feature = "logging")]
         info!(
             "Creating savepoint id={:?}, txn_id={:?}",
@@ -599,7 +649,7 @@ impl<'db> WriteTransaction<'db> {
         let system_root = self.mem.get_system_root();
         let freed_root = self.mem.get_freed_root();
         let savepoint = Savepoint::new_ephemeral(
-            self.db.get_memory(),
+            &self.mem,
             self.transaction_tracker.clone(),
             id,
             transaction_id,
@@ -624,8 +674,6 @@ impl<'db> WriteTransaction<'db> {
 
         if !self
             .transaction_tracker
-            .lock()
-            .unwrap()
             .is_valid_savepoint(savepoint.get_id())
         {
             return Err(SavepointError::InvalidSavepoint);
@@ -638,7 +686,7 @@ impl<'db> WriteTransaction<'db> {
         );
         // Restoring a savepoint that reverted a file format or checksum type change could corrupt
         // the database
-        assert_eq!(self.db.get_memory().get_version(), savepoint.get_version());
+        assert_eq!(self.mem.get_version(), savepoint.get_version());
         self.dirty.store(true, Ordering::Release);
 
         let allocated_since_savepoint = self
@@ -665,9 +713,10 @@ impl<'db> WriteTransaction<'db> {
             }
         }
         *self.freed_pages.lock().unwrap() = freed_pages;
-        self.tables.lock().unwrap().table_tree = TableTree::new(
+        self.tables.lock().unwrap().table_tree = TableTreeMut::new(
             savepoint.get_user_root(),
-            self.mem,
+            self.transaction_guard.clone(),
+            self.mem.clone(),
             self.freed_pages.clone(),
         );
 
@@ -687,7 +736,8 @@ impl<'db> WriteTransaction<'db> {
 
         let mut freed_tree = BtreeMut::new(
             savepoint.get_freed_root(),
-            self.mem,
+            self.transaction_guard.clone(),
+            self.mem.clone(),
             self.post_commit_frees.clone(),
         );
         let lookup_key = FreedTableKey {
@@ -707,8 +757,6 @@ impl<'db> WriteTransaction<'db> {
         // Invalidate all savepoints that are newer than the one being applied to prevent the user
         // from later trying to restore a savepoint "on another timeline"
         self.transaction_tracker
-            .lock()
-            .unwrap()
             .invalidate_savepoints_after(savepoint.get_id());
 
         for persistent_savepoint in self.list_persistent_savepoints()? {
@@ -743,10 +791,10 @@ impl<'db> WriteTransaction<'db> {
     ///
     /// The table will be created if it does not exist
     #[track_caller]
-    pub fn open_table<'txn, K: RedbKey + 'static, V: RedbValue + 'static>(
+    pub fn open_table<'txn, K: Key + 'static, V: Value + 'static>(
         &'txn self,
         definition: TableDefinition<K, V>,
-    ) -> Result<Table<'db, 'txn, K, V>, TableError> {
+    ) -> Result<Table<'txn, K, V>, TableError> {
         self.tables.lock().unwrap().open_table(self, definition)
     }
 
@@ -754,22 +802,23 @@ impl<'db> WriteTransaction<'db> {
     ///
     /// The table will be created if it does not exist
     #[track_caller]
-    pub fn open_multimap_table<'txn, K: RedbKey + 'static, V: RedbKey + 'static>(
+    pub fn open_multimap_table<'txn, K: Key + 'static, V: Key + 'static>(
         &'txn self,
         definition: MultimapTableDefinition<K, V>,
-    ) -> Result<MultimapTable<'db, 'txn, K, V>, TableError> {
+    ) -> Result<MultimapTable<'txn, K, V>, TableError> {
         self.tables
             .lock()
             .unwrap()
             .open_multimap_table(self, definition)
     }
 
-    pub(crate) fn close_table<K: RedbKey + 'static, V: RedbValue + 'static>(
+    pub(crate) fn close_table<K: Key + 'static, V: Value + 'static>(
         &self,
         name: &str,
         table: &BtreeMut<K, V>,
+        length: u64,
     ) {
-        self.tables.lock().unwrap().close_table(name, table);
+        self.tables.lock().unwrap().close_table(name, table, length);
     }
 
     /// Delete the given table
@@ -845,8 +894,6 @@ impl<'db> WriteTransaction<'db> {
 
         for (savepoint, transaction) in self.deleted_persistent_savepoints.lock().unwrap().iter() {
             self.transaction_tracker
-                .lock()
-                .unwrap()
                 .deallocate_savepoint(*savepoint, *transaction);
         }
 
@@ -898,8 +945,6 @@ impl<'db> WriteTransaction<'db> {
     pub(crate) fn durable_commit(&mut self, eventual: bool, two_phase: bool) -> Result {
         let oldest_live_read = self
             .transaction_tracker
-            .lock()
-            .unwrap()
             .oldest_live_read_transaction()
             .unwrap_or(self.transaction_id);
 
@@ -922,11 +967,7 @@ impl<'db> WriteTransaction<'db> {
         // root of the freed-tree. Therefore, we must use the transactional free mechanism to free
         // those pages. If there are no save points then these can be immediately freed, which is
         // done at the end of this function.
-        let savepoint_exists = self
-            .transaction_tracker
-            .lock()
-            .unwrap()
-            .any_savepoint_exists();
+        let savepoint_exists = self.transaction_tracker.any_savepoint_exists();
         self.store_freed_pages(savepoint_exists)?;
 
         // Finalize freed table checksums, before doing the final commit
@@ -945,10 +986,7 @@ impl<'db> WriteTransaction<'db> {
         )?;
 
         // Mark any pending non-durable commits as fully committed.
-        self.transaction_tracker
-            .lock()
-            .unwrap()
-            .clear_pending_non_durable_commits();
+        self.transaction_tracker.clear_pending_non_durable_commits();
 
         // Immediately free the pages that were freed from the freed-tree itself. These are only
         // accessed by write transactions, so it's safe to free them as soon as the commit is done.
@@ -989,8 +1027,6 @@ impl<'db> WriteTransaction<'db> {
         // Register this as a non-durable transaction to ensure that the freed pages we just pushed
         // are only processed after this has been persisted
         self.transaction_tracker
-            .lock()
-            .unwrap()
             .register_non_durable_commit(self.transaction_id);
         Ok(())
     }
@@ -1113,17 +1149,15 @@ impl<'db> WriteTransaction<'db> {
     #[allow(dead_code)]
     pub(crate) fn print_debug(&self) -> Result {
         // Flush any pending updates to make sure we get the latest root
-        if let Some(page) = self
-            .tables
-            .lock()
-            .unwrap()
-            .table_tree
-            .flush_table_root_updates()
-            .unwrap()
-        {
+        let mut tables = self.tables.lock().unwrap();
+        if let Some(page) = tables.table_tree.flush_table_root_updates().unwrap() {
             eprintln!("Master tree:");
-            let master_tree: Btree<&str, InternalTableDefinition> =
-                Btree::new(Some(page), PageHint::None, self.mem)?;
+            let master_tree: Btree<&str, InternalTableDefinition> = Btree::new(
+                Some(page),
+                PageHint::None,
+                self.transaction_guard.clone(),
+                self.mem.clone(),
+            )?;
             master_tree.print_debug(true)?;
         }
 
@@ -1131,9 +1165,8 @@ impl<'db> WriteTransaction<'db> {
     }
 }
 
-impl<'a> Drop for WriteTransaction<'a> {
+impl Drop for WriteTransaction {
     fn drop(&mut self) {
-        self.db.end_write_transaction(self.transaction_id);
         if !self.completed && !thread::panicking() && !self.mem.storage_failure() {
             #[allow(unused_variables)]
             if let Err(error) = self.abort_inner() {
@@ -1147,30 +1180,29 @@ impl<'a> Drop for WriteTransaction<'a> {
 /// A read-only transaction
 ///
 /// Read-only transactions may exist concurrently with writes
-pub struct ReadTransaction<'a> {
-    transaction_tracker: Arc<Mutex<TransactionTracker>>,
-    mem: &'a TransactionalMemory,
-    tree: TableTree<'a>,
-    transaction_id: TransactionId,
+pub struct ReadTransaction {
+    mem: Arc<TransactionalMemory>,
+    tree: TableTree,
+    transaction_guard: Arc<TransactionGuard>,
 }
 
-impl<'db> ReadTransaction<'db> {
+impl ReadTransaction {
     pub(crate) fn new(
-        mem: &'db TransactionalMemory,
-        transaction_tracker: Arc<Mutex<TransactionTracker>>,
-        transaction_id: TransactionId,
-    ) -> Self {
+        mem: Arc<TransactionalMemory>,
+        guard: TransactionGuard,
+    ) -> Result<Self, TransactionError> {
         let root_page = mem.get_data_root();
-        Self {
-            transaction_tracker,
-            mem,
-            tree: TableTree::new(root_page, mem, Default::default()),
-            transaction_id,
-        }
+        let guard = Arc::new(guard);
+        Ok(Self {
+            mem: mem.clone(),
+            tree: TableTree::new(root_page, PageHint::Clean, guard.clone(), mem)
+                .map_err(TransactionError::Storage)?,
+            transaction_guard: guard,
+        })
     }
 
     /// Open the given table
-    pub fn open_table<K: RedbKey + 'static, V: RedbValue + 'static>(
+    pub fn open_table<K: Key + 'static, V: Value + 'static>(
         &self,
         definition: TableDefinition<K, V>,
     ) -> Result<ReadOnlyTable<K, V>, TableError> {
@@ -1183,7 +1215,8 @@ impl<'db> ReadTransaction<'db> {
             definition.name().to_string(),
             header.get_root(),
             PageHint::Clean,
-            self.mem,
+            self.transaction_guard.clone(),
+            self.mem.clone(),
         )?)
     }
 
@@ -1201,12 +1234,12 @@ impl<'db> ReadTransaction<'db> {
             header.get_root(),
             header.get_fixed_key_size(),
             header.get_fixed_value_size(),
-            self.mem,
+            self.mem.clone(),
         ))
     }
 
     /// Open the given table
-    pub fn open_multimap_table<K: RedbKey + 'static, V: RedbKey + 'static>(
+    pub fn open_multimap_table<K: Key + 'static, V: Key + 'static>(
         &self,
         definition: MultimapTableDefinition<K, V>,
     ) -> Result<ReadOnlyMultimapTable<K, V>, TableError> {
@@ -1217,8 +1250,10 @@ impl<'db> ReadTransaction<'db> {
 
         Ok(ReadOnlyMultimapTable::new(
             header.get_root(),
+            header.get_length(),
             PageHint::Clean,
-            self.mem,
+            self.transaction_guard.clone(),
+            self.mem.clone(),
         )?)
     }
 
@@ -1234,9 +1269,10 @@ impl<'db> ReadTransaction<'db> {
 
         Ok(ReadOnlyUntypedMultimapTable::new(
             header.get_root(),
+            header.get_length(),
             header.get_fixed_key_size(),
             header.get_fixed_value_size(),
-            self.mem,
+            self.mem.clone(),
         ))
     }
 
@@ -1253,14 +1289,26 @@ impl<'db> ReadTransaction<'db> {
             .list_tables(TableType::Multimap)
             .map(|x| x.into_iter().map(UntypedMultimapTableHandle::new))
     }
+
+    /// Close the transaction
+    ///
+    /// Transactions are automatically closed when they and all objects referencing them have been dropped,
+    /// so this method does not normally need to be called.
+    /// This method can be used to ensure that there are no outstanding objects remaining.
+    ///
+    /// Returns `ReadTransactionStillInUse` error if a table or other object retrieved from the transaction still references this transaction
+    pub fn close(self) -> Result<(), TransactionError> {
+        if Arc::strong_count(&self.transaction_guard) > 1 {
+            return Err(TransactionError::ReadTransactionStillInUse(self));
+        }
+        // No-op, just drop ourself
+        Ok(())
+    }
 }
 
-impl<'a> Drop for ReadTransaction<'a> {
-    fn drop(&mut self) {
-        self.transaction_tracker
-            .lock()
-            .unwrap()
-            .deallocate_read_transaction(self.transaction_id);
+impl Debug for ReadTransaction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReadTransaction")
     }
 }
 

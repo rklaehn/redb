@@ -1,4 +1,6 @@
-use redb::{Database, MultimapTableDefinition, ReadableMultimapTable, TableError};
+use redb::{
+    Database, MultimapTableDefinition, ReadableMultimapTable, ReadableTableMetadata, TableError,
+};
 
 const STR_TABLE: MultimapTableDefinition<&str, &str> = MultimapTableDefinition::new("str_to_str");
 const SLICE_U64_TABLE: MultimapTableDefinition<&[u8], u64> =
@@ -45,6 +47,8 @@ fn len() {
     let read_txn = db.begin_read().unwrap();
     let table = read_txn.open_multimap_table(STR_TABLE).unwrap();
     assert_eq!(table.len().unwrap(), 3);
+    let untyped_table = read_txn.open_untyped_multimap_table(STR_TABLE).unwrap();
+    assert_eq!(untyped_table.len().unwrap(), 3);
 }
 
 #[test]
@@ -173,6 +177,64 @@ fn range_lifetime() {
 }
 
 #[test]
+fn range_arc_lifetime() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: MultimapTableDefinition<&str, &str> = MultimapTableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_multimap_table(definition).unwrap();
+        table.insert("hello", "world").unwrap();
+    }
+    write_txn.commit().unwrap();
+
+    let mut iter = {
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_multimap_table(definition).unwrap();
+        let start = "hello".to_string();
+        table.range::<&str>(start.as_str()..).unwrap()
+    };
+    assert_eq!(
+        iter.next()
+            .unwrap()
+            .unwrap()
+            .1
+            .next()
+            .unwrap()
+            .unwrap()
+            .value(),
+        "world"
+    );
+    assert!(iter.next().is_none());
+}
+
+#[test]
+fn get_arc_lifetime() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: MultimapTableDefinition<&str, &str> = MultimapTableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_multimap_table(definition).unwrap();
+        table.insert("hello", "world").unwrap();
+    }
+    write_txn.commit().unwrap();
+
+    let mut iter = {
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_multimap_table(definition).unwrap();
+        let start = "hello".to_string();
+        table.get(start.as_str()).unwrap()
+    };
+    assert_eq!(iter.next().unwrap().unwrap().value(), "world");
+    assert!(iter.next().is_none());
+}
+
+#[test]
 fn delete() {
     let tmpfile = create_tempfile();
     let db = Database::create(tmpfile.path()).unwrap();
@@ -187,6 +249,7 @@ fn delete() {
 
     let read_txn = db.begin_read().unwrap();
     let table = read_txn.open_multimap_table(STR_TABLE).unwrap();
+    assert_eq!(3, table.get("hello").unwrap().len());
     assert_eq!(
         vec![
             "world".to_string(),

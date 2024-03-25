@@ -5,8 +5,6 @@ use std::collections::HashMap;
 #[cfg(debug_assertions)]
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
-#[cfg(not(debug_assertions))]
-use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::Arc;
 #[cfg(debug_assertions)]
@@ -150,23 +148,27 @@ pub(crate) trait Page {
     fn get_page_number(&self) -> PageNumber;
 }
 
-pub struct PageImpl<'a> {
+pub struct PageImpl {
     pub(super) mem: Arc<Vec<u8>>,
     pub(super) page_number: PageNumber,
     #[cfg(debug_assertions)]
-    pub(super) open_pages: &'a Mutex<HashMap<PageNumber, u64>>,
-    #[cfg(not(debug_assertions))]
-    pub(super) _debug_lifetime: PhantomData<&'a ()>,
+    pub(super) open_pages: Arc<Mutex<HashMap<PageNumber, u64>>>,
 }
 
-impl<'a> Debug for PageImpl<'a> {
+impl PageImpl {
+    pub(crate) fn to_arc_vec(&self) -> Arc<Vec<u8>> {
+        self.mem.clone()
+    }
+}
+
+impl Debug for PageImpl {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("PageImpl: page_number={:?}", self.page_number))
     }
 }
 
 #[cfg(debug_assertions)]
-impl<'a> Drop for PageImpl<'a> {
+impl Drop for PageImpl {
     fn drop(&mut self) {
         let mut open_pages = self.open_pages.lock().unwrap();
         let value = open_pages.get_mut(&self.page_number).unwrap();
@@ -178,7 +180,7 @@ impl<'a> Drop for PageImpl<'a> {
     }
 }
 
-impl<'a> Page for PageImpl<'a> {
+impl Page for PageImpl {
     fn memory(&self) -> &[u8] {
         self.mem.as_ref()
     }
@@ -188,7 +190,7 @@ impl<'a> Page for PageImpl<'a> {
     }
 }
 
-impl<'a> Clone for PageImpl<'a> {
+impl Clone for PageImpl {
     fn clone(&self) -> Self {
         #[cfg(debug_assertions)]
         {
@@ -203,29 +205,25 @@ impl<'a> Clone for PageImpl<'a> {
             mem: self.mem.clone(),
             page_number: self.page_number,
             #[cfg(debug_assertions)]
-            open_pages: self.open_pages,
-            #[cfg(not(debug_assertions))]
-            _debug_lifetime: Default::default(),
+            open_pages: self.open_pages.clone(),
         }
     }
 }
 
-pub(crate) struct PageMut<'a> {
-    pub(super) mem: WritablePage<'a>,
+pub(crate) struct PageMut {
+    pub(super) mem: WritablePage,
     pub(super) page_number: PageNumber,
     #[cfg(debug_assertions)]
-    pub(super) open_pages: &'a Mutex<HashSet<PageNumber>>,
-    #[cfg(not(debug_assertions))]
-    pub(super) _debug_lifetime: PhantomData<&'a ()>,
+    pub(super) open_pages: Arc<Mutex<HashSet<PageNumber>>>,
 }
 
-impl<'a> PageMut<'a> {
+impl PageMut {
     pub(crate) fn memory_mut(&mut self) -> &mut [u8] {
         self.mem.mem_mut()
     }
 }
 
-impl<'a> Page for PageMut<'a> {
+impl Page for PageMut {
     fn memory(&self) -> &[u8] {
         self.mem.mem()
     }
@@ -236,7 +234,7 @@ impl<'a> Page for PageMut<'a> {
 }
 
 #[cfg(debug_assertions)]
-impl<'a> Drop for PageMut<'a> {
+impl Drop for PageMut {
     fn drop(&mut self) {
         assert!(self.open_pages.lock().unwrap().remove(&self.page_number));
     }

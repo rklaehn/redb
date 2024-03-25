@@ -1,7 +1,11 @@
 use crate::transaction_tracker::TransactionId;
+use crate::tree_store::btree_base::BtreeHeader;
 use crate::tree_store::page_store::layout::{DatabaseLayout, RegionLayout};
-use crate::tree_store::page_store::page_manager::{xxh3_checksum, FILE_FORMAT_VERSION};
+use crate::tree_store::page_store::page_manager::{
+    xxh3_checksum, FILE_FORMAT_VERSION1, FILE_FORMAT_VERSION2,
+};
 use crate::tree_store::{Checksum, PageNumber};
+use crate::{DatabaseError, StorageError};
 use std::mem::size_of;
 
 // Database layout:
@@ -61,14 +65,13 @@ const USER_ROOT_NON_NULL_OFFSET: usize = size_of::<u8>();
 const SYSTEM_ROOT_NON_NULL_OFFSET: usize = USER_ROOT_NON_NULL_OFFSET + size_of::<u8>();
 const FREED_ROOT_NON_NULL_OFFSET: usize = SYSTEM_ROOT_NON_NULL_OFFSET + size_of::<u8>();
 const PADDING: usize = 4;
-const USER_ROOT_PAGE_OFFSET: usize = FREED_ROOT_NON_NULL_OFFSET + size_of::<u8>() + PADDING;
-const USER_ROOT_CHECKSUM_OFFSET: usize = USER_ROOT_PAGE_OFFSET + size_of::<u64>();
-const SYSTEM_ROOT_PAGE_OFFSET: usize = USER_ROOT_CHECKSUM_OFFSET + size_of::<u128>();
-const SYSTEM_ROOT_CHECKSUM_OFFSET: usize = SYSTEM_ROOT_PAGE_OFFSET + size_of::<u64>();
-const FREED_ROOT_OFFSET: usize = SYSTEM_ROOT_CHECKSUM_OFFSET + size_of::<u128>();
-const FREED_ROOT_CHECKSUM_OFFSET: usize = FREED_ROOT_OFFSET + size_of::<u64>();
-const TRANSACTION_ID_OFFSET: usize = FREED_ROOT_CHECKSUM_OFFSET + size_of::<u128>();
+
+const USER_ROOT_OFFSET: usize = FREED_ROOT_NON_NULL_OFFSET + size_of::<u8>() + PADDING;
+const SYSTEM_ROOT_OFFSET: usize = USER_ROOT_OFFSET + BtreeHeader::serialized_size();
+const FREED_ROOT_OFFSET: usize = SYSTEM_ROOT_OFFSET + BtreeHeader::serialized_size();
+const TRANSACTION_ID_OFFSET: usize = FREED_ROOT_OFFSET + BtreeHeader::serialized_size();
 const TRANSACTION_LAST_FIELD: usize = TRANSACTION_ID_OFFSET + size_of::<u64>();
+
 const SLOT_CHECKSUM_OFFSET: usize = TRANSACTION_SIZE - size_of::<Checksum>();
 
 pub(crate) const PAGE_SIZE: usize = 4096;
@@ -105,6 +108,7 @@ impl DatabaseHeader {
     pub(super) fn new(
         layout: DatabaseLayout,
         transaction_id: TransactionId,
+        version: u8,
         region_tracker: PageNumber,
     ) -> Self {
         #[allow(clippy::assertions_on_constants)]
@@ -112,7 +116,7 @@ impl DatabaseHeader {
             assert!(TRANSACTION_LAST_FIELD <= SLOT_CHECKSUM_OFFSET);
         }
 
-        let slot = TransactionHeader::new(transaction_id);
+        let slot = TransactionHeader::new(transaction_id, version);
         Self {
             primary_slot: 0,
             recovery_required: true,
@@ -191,7 +195,7 @@ impl DatabaseHeader {
     }
 
     // TODO: consider returning an Err with the repair info
-    pub(super) fn from_bytes(data: &[u8]) -> (Self, HeaderRepairInfo) {
+    pub(super) fn from_bytes(data: &[u8]) -> Result<(Self, HeaderRepairInfo), DatabaseError> {
         let invalid_magic_number = data[..MAGICNUMBER.len()] != MAGICNUMBER;
 
         let primary_slot = usize::from(data[GOD_BYTE_OFFSET] & PRIMARY_BIT != 0);
@@ -207,8 +211,12 @@ impl DatabaseHeader {
                 .try_into()
                 .unwrap(),
         );
-        let (slot0, slot0_corrupted) = TransactionHeader::from_bytes(&data[TRANSACTION_0_OFFSET..]);
-        let (slot1, slot1_corrupted) = TransactionHeader::from_bytes(&data[TRANSACTION_1_OFFSET..]);
+        let (slot0, slot0_corrupted) = TransactionHeader::from_bytes(
+            &data[TRANSACTION_0_OFFSET..(TRANSACTION_0_OFFSET + TRANSACTION_SIZE)],
+        )?;
+        let (slot1, slot1_corrupted) = TransactionHeader::from_bytes(
+            &data[TRANSACTION_1_OFFSET..(TRANSACTION_1_OFFSET + TRANSACTION_SIZE)],
+        )?;
         let (primary_corrupted, secondary_corrupted) = if primary_slot == 0 {
             (slot0_corrupted, slot1_corrupted)
         } else {
@@ -231,7 +239,7 @@ impl DatabaseHeader {
             primary_corrupted,
             secondary_corrupted,
         };
-        (result, repair)
+        Ok((result, repair))
     }
 
     pub(super) fn to_bytes(
@@ -276,16 +284,16 @@ impl DatabaseHeader {
 #[derive(Clone)]
 pub(super) struct TransactionHeader {
     pub(super) version: u8,
-    pub(super) user_root: Option<(PageNumber, Checksum)>,
-    pub(super) system_root: Option<(PageNumber, Checksum)>,
-    pub(super) freed_root: Option<(PageNumber, Checksum)>,
+    pub(super) user_root: Option<BtreeHeader>,
+    pub(super) system_root: Option<BtreeHeader>,
+    pub(super) freed_root: Option<BtreeHeader>,
     pub(super) transaction_id: TransactionId,
 }
 
 impl TransactionHeader {
-    fn new(transaction_id: TransactionId) -> Self {
+    fn new(transaction_id: TransactionId, version: u8) -> Self {
         Self {
-            version: FILE_FORMAT_VERSION,
+            version,
             user_root: None,
             system_root: None,
             freed_root: None,
@@ -294,8 +302,18 @@ impl TransactionHeader {
     }
 
     // Returned bool indicates whether the checksum was corrupted
-    pub(super) fn from_bytes(data: &[u8]) -> (Self, bool) {
+    pub(super) fn from_bytes(data: &[u8]) -> Result<(Self, bool), DatabaseError> {
         let version = data[VERSION_OFFSET];
+        match version {
+            FILE_FORMAT_VERSION1 => return Err(DatabaseError::UpgradeRequired(version)),
+            FILE_FORMAT_VERSION2 => {}
+            _ => {
+                return Err(StorageError::Corrupted(format!(
+                    "Expected file format version <= {FILE_FORMAT_VERSION2}, found {version}",
+                ))
+                .into())
+            }
+        }
         let checksum = Checksum::from_le_bytes(
             data[SLOT_CHECKSUM_OFFSET..(SLOT_CHECKSUM_OFFSET + size_of::<Checksum>())]
                 .try_into()
@@ -304,52 +322,29 @@ impl TransactionHeader {
         let corrupted = checksum != xxh3_checksum(&data[..SLOT_CHECKSUM_OFFSET]);
 
         let user_root = if data[USER_ROOT_NON_NULL_OFFSET] != 0 {
-            let page = PageNumber::from_le_bytes(
-                data[USER_ROOT_PAGE_OFFSET
-                    ..(USER_ROOT_PAGE_OFFSET + PageNumber::serialized_size())]
+            Some(BtreeHeader::from_le_bytes(
+                data[USER_ROOT_OFFSET..(USER_ROOT_OFFSET + BtreeHeader::serialized_size())]
                     .try_into()
                     .unwrap(),
-            );
-            let checksum = Checksum::from_le_bytes(
-                data[USER_ROOT_CHECKSUM_OFFSET
-                    ..(USER_ROOT_CHECKSUM_OFFSET + size_of::<Checksum>())]
-                    .try_into()
-                    .unwrap(),
-            );
-            Some((page, checksum))
+            ))
         } else {
             None
         };
         let system_root = if data[SYSTEM_ROOT_NON_NULL_OFFSET] != 0 {
-            let page = PageNumber::from_le_bytes(
-                data[SYSTEM_ROOT_PAGE_OFFSET
-                    ..(SYSTEM_ROOT_PAGE_OFFSET + PageNumber::serialized_size())]
+            Some(BtreeHeader::from_le_bytes(
+                data[SYSTEM_ROOT_OFFSET..(SYSTEM_ROOT_OFFSET + BtreeHeader::serialized_size())]
                     .try_into()
                     .unwrap(),
-            );
-            let checksum = Checksum::from_le_bytes(
-                data[SYSTEM_ROOT_CHECKSUM_OFFSET
-                    ..(SYSTEM_ROOT_CHECKSUM_OFFSET + size_of::<Checksum>())]
-                    .try_into()
-                    .unwrap(),
-            );
-            Some((page, checksum))
+            ))
         } else {
             None
         };
         let freed_root = if data[FREED_ROOT_NON_NULL_OFFSET] != 0 {
-            let page = PageNumber::from_le_bytes(
-                data[FREED_ROOT_OFFSET..(FREED_ROOT_OFFSET + PageNumber::serialized_size())]
+            Some(BtreeHeader::from_le_bytes(
+                data[FREED_ROOT_OFFSET..(FREED_ROOT_OFFSET + BtreeHeader::serialized_size())]
                     .try_into()
                     .unwrap(),
-            );
-            let checksum = Checksum::from_le_bytes(
-                data[FREED_ROOT_CHECKSUM_OFFSET
-                    ..(FREED_ROOT_CHECKSUM_OFFSET + size_of::<Checksum>())]
-                    .try_into()
-                    .unwrap(),
-            );
-            Some((page, checksum))
+            ))
         } else {
             None
         };
@@ -363,35 +358,27 @@ impl TransactionHeader {
             transaction_id,
         };
 
-        (result, corrupted)
+        Ok((result, corrupted))
     }
 
     pub(super) fn to_bytes(&self) -> [u8; TRANSACTION_SIZE] {
+        assert_eq!(self.version, FILE_FORMAT_VERSION2);
         let mut result = [0; TRANSACTION_SIZE];
         result[VERSION_OFFSET] = self.version;
-        if let Some((page, checksum)) = self.user_root {
+        if let Some(header) = self.user_root {
             result[USER_ROOT_NON_NULL_OFFSET] = 1;
-            result[USER_ROOT_PAGE_OFFSET..(USER_ROOT_PAGE_OFFSET + PageNumber::serialized_size())]
-                .copy_from_slice(&page.to_le_bytes());
-            result[USER_ROOT_CHECKSUM_OFFSET..(USER_ROOT_CHECKSUM_OFFSET + size_of::<Checksum>())]
-                .copy_from_slice(&checksum.to_le_bytes());
+            result[USER_ROOT_OFFSET..(USER_ROOT_OFFSET + BtreeHeader::serialized_size())]
+                .copy_from_slice(&header.to_le_bytes());
         }
-        if let Some((page, checksum)) = self.system_root {
+        if let Some(header) = self.system_root {
             result[SYSTEM_ROOT_NON_NULL_OFFSET] = 1;
-            result[SYSTEM_ROOT_PAGE_OFFSET
-                ..(SYSTEM_ROOT_PAGE_OFFSET + PageNumber::serialized_size())]
-                .copy_from_slice(&page.to_le_bytes());
-            result[SYSTEM_ROOT_CHECKSUM_OFFSET
-                ..(SYSTEM_ROOT_CHECKSUM_OFFSET + size_of::<Checksum>())]
-                .copy_from_slice(&checksum.to_le_bytes());
+            result[SYSTEM_ROOT_OFFSET..(SYSTEM_ROOT_OFFSET + BtreeHeader::serialized_size())]
+                .copy_from_slice(&header.to_le_bytes());
         }
-        if let Some((page, checksum)) = self.freed_root {
+        if let Some(header) = self.freed_root {
             result[FREED_ROOT_NON_NULL_OFFSET] = 1;
-            result[FREED_ROOT_OFFSET..(FREED_ROOT_OFFSET + PageNumber::serialized_size())]
-                .copy_from_slice(&page.to_le_bytes());
-            result
-                [FREED_ROOT_CHECKSUM_OFFSET..(FREED_ROOT_CHECKSUM_OFFSET + size_of::<Checksum>())]
-                .copy_from_slice(&checksum.to_le_bytes());
+            result[FREED_ROOT_OFFSET..(FREED_ROOT_OFFSET + BtreeHeader::serialized_size())]
+                .copy_from_slice(&header.to_le_bytes());
         }
         result[TRANSACTION_ID_OFFSET..(TRANSACTION_ID_OFFSET + size_of::<u64>())]
             .copy_from_slice(&self.transaction_id.raw_id().to_le_bytes());
@@ -409,7 +396,7 @@ mod test {
     use crate::db::TableDefinition;
     use crate::tree_store::page_store::header::{
         GOD_BYTE_OFFSET, MAGICNUMBER, PAGE_SIZE, PRIMARY_BIT, RECOVERY_REQUIRED,
-        TRANSACTION_0_OFFSET, TRANSACTION_1_OFFSET, USER_ROOT_CHECKSUM_OFFSET,
+        TRANSACTION_0_OFFSET, TRANSACTION_1_OFFSET, USER_ROOT_OFFSET,
     };
     use crate::tree_store::page_store::TransactionalMemory;
     #[cfg(not(target_os = "windows"))]
@@ -464,7 +451,7 @@ mod test {
             TRANSACTION_1_OFFSET
         };
         file.seek(SeekFrom::Start(
-            (primary_slot_offset + USER_ROOT_CHECKSUM_OFFSET) as u64,
+            (primary_slot_offset + USER_ROOT_OFFSET) as u64,
         ))
         .unwrap();
         file.write_all(&[0; size_of::<u128>()]).unwrap();
@@ -509,7 +496,7 @@ mod test {
                 TRANSACTION_1_OFFSET
             };
             file.seek(SeekFrom::Start(
-                (primary_slot_offset + USER_ROOT_CHECKSUM_OFFSET) as u64,
+                (primary_slot_offset + USER_ROOT_OFFSET) as u64,
             ))
             .unwrap();
             file.write_all(&[0; size_of::<u128>()]).unwrap();
@@ -522,19 +509,19 @@ mod test {
             file.read_exact(&mut buffer).unwrap();
 
             file.seek(SeekFrom::Start(
-                (TRANSACTION_0_OFFSET + USER_ROOT_CHECKSUM_OFFSET) as u64,
+                (TRANSACTION_0_OFFSET + USER_ROOT_OFFSET) as u64,
             ))
             .unwrap();
             file.write_all(&[0; size_of::<u128>()]).unwrap();
             file.seek(SeekFrom::Start(
-                (TRANSACTION_1_OFFSET + USER_ROOT_CHECKSUM_OFFSET) as u64,
+                (TRANSACTION_1_OFFSET + USER_ROOT_OFFSET) as u64,
             ))
             .unwrap();
             file.write_all(&[0; size_of::<u128>()]).unwrap();
 
             assert!(matches!(
                 db2.check_integrity().unwrap_err(),
-                StorageError::Corrupted(_)
+                DatabaseError::Storage(StorageError::Corrupted(_))
             ));
         }
     }

@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use redb::{AccessGuard, Database, Durability, Error, MultimapTable, MultimapTableDefinition, MultimapValue, ReadableMultimapTable, ReadableTable, Savepoint, StorageBackend, Table, TableDefinition, WriteTransaction};
+use redb::{AccessGuard, Database, Durability, Error, MultimapTable, MultimapTableDefinition, MultimapValue, ReadableMultimapTable, ReadableTable, ReadableTableMetadata, Savepoint, StorageBackend, Table, TableDefinition, WriteTransaction};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Debug;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
@@ -268,10 +268,16 @@ fn handle_multimap_table_op(op: &FuzzOperation, reference: &mut BTreeMap<u64, BT
         FuzzOperation::PopLast { .. } => {
             // no-op. Multimap tables don't support this
         }
-        FuzzOperation::Drain { .. } => {
+        FuzzOperation::ExtractIf { .. } => {
             // no-op. Multimap tables don't support this
         }
-        FuzzOperation::DrainFilter { .. } => {
+        FuzzOperation::ExtractFromIf { .. } => {
+            // no-op. Multimap tables don't support this
+        }
+        FuzzOperation::Retain { .. } => {
+            // no-op. Multimap tables don't support this
+        }
+        FuzzOperation::RetainIn { .. } => {
             // no-op. Multimap tables don't support this
         }
         FuzzOperation::Range {
@@ -372,61 +378,85 @@ fn handle_table_op(op: &FuzzOperation, reference: &mut BTreeMap<u64, usize>, tab
                 assert!(table.pop_first()?.is_none());
             }
         }
-        FuzzOperation::Drain { start_key, len, reversed } => {
-            let start = start_key.value;
-            let end = start + len.value;
-            let mut reference_iter: Box<dyn Iterator<Item = (&u64, &usize)>> =
-                if *reversed {
-                    Box::new(reference.range(start..end).rev())
-                } else {
-                    Box::new(reference.range(start..end))
-                };
-            let mut iter: Box<dyn Iterator<Item = Result<(AccessGuard<u64>, AccessGuard<&[u8]>), redb::StorageError>>> = if *reversed {
-                Box::new(table.drain(start..end)?.rev())
-            } else {
-                Box::new(table.drain(start..end)?)
-            };
-            while let Some((ref_key, ref_value_len)) = reference_iter.next() {
-                let (key, value) = iter.next().unwrap()?;
-                assert_eq!(*ref_key, key.value());
-                assert_eq!(*ref_value_len, value.value().len());
-            }
-            drop(reference_iter);
-            reference.retain(|x, _| *x < start || *x >= end);
-            // This is basically assert!(iter.next().is_none()), but we also allow an Err such as a simulated IO error
-            if let Some(Ok((_, _)))  = iter.next() {
-                panic!();
-            }
-        }
-        FuzzOperation::DrainFilter { start_key, len, modulus, reversed } => {
-            let start = start_key.value;
-            let end = start + len.value;
+        FuzzOperation::ExtractIf { take, modulus, reversed } => {
             let modulus = modulus.value;
             let mut reference_iter: Box<dyn Iterator<Item = (&u64, &usize)>> =
                 if *reversed {
-                    Box::new(reference.range(start..end).rev())
+                    Box::new(reference.iter().rev().take(take.value))
                 } else {
-                    Box::new(reference.range(start..end))
+                    Box::new(reference.iter().take(take.value))
                 };
             let mut iter: Box<dyn Iterator<Item = Result<(AccessGuard<u64>, AccessGuard<&[u8]>), redb::StorageError>>> = if *reversed {
-                Box::new(table.drain_filter(start..end, |x, _| x % modulus == 0)?.rev())
+                Box::new(table.extract_if(|x, _| x % modulus == 0)?.rev())
             } else {
-                Box::new(table.drain_filter(start..end, |x, _| x % modulus == 0)?)
+                Box::new(table.extract_if(|x, _| x % modulus == 0)?)
             };
+            let mut remaining = take.value;
+            let mut remove_from_reference = vec![];
             while let Some((ref_key, ref_value_len)) = reference_iter.next() {
                 if *ref_key % modulus != 0 {
                     continue;
                 }
+                if remaining == 0 {
+                    break;
+                }
+                remaining -= 1;
                 let (key, value) = iter.next().unwrap()?;
+                remove_from_reference.push(*ref_key);
                 assert_eq!(*ref_key, key.value());
                 assert_eq!(*ref_value_len, value.value().len());
             }
             drop(reference_iter);
-            reference.retain(|x, _| (*x < start || *x >= end) || *x % modulus != 0);
-            // This is basically assert!(iter.next().is_none()), but we also allow an Err such as a simulated IO error
-            if let Some(Ok((_, _)))  = iter.next() {
-                panic!();
+            for x in remove_from_reference {
+                reference.remove(&x);
             }
+        }
+        FuzzOperation::ExtractFromIf { start_key, range_len, take, modulus, reversed } => {
+            let start = start_key.value;
+            let end = start + range_len.value;
+            let modulus = modulus.value;
+            let mut reference_iter: Box<dyn Iterator<Item = (&u64, &usize)>> =
+                if *reversed {
+                    Box::new(reference.range(start..end).rev().take(take.value))
+                } else {
+                    Box::new(reference.range(start..end).take(take.value))
+                };
+            let mut iter: Box<dyn Iterator<Item = Result<(AccessGuard<u64>, AccessGuard<&[u8]>), redb::StorageError>>> = if *reversed {
+                Box::new(table.extract_from_if(start..end, |x, _| x % modulus == 0)?.rev())
+            } else {
+                Box::new(table.extract_from_if(start..end, |x, _| x % modulus == 0)?)
+            };
+            let mut remaining = take.value;
+            let mut remove_from_reference = vec![];
+            while let Some((ref_key, ref_value_len)) = reference_iter.next() {
+                if *ref_key % modulus != 0 {
+                    continue;
+                }
+                if remaining == 0 {
+                    break;
+                }
+                remaining -= 1;
+                let (key, value) = iter.next().unwrap()?;
+                remove_from_reference.push(*ref_key);
+                assert_eq!(*ref_key, key.value());
+                assert_eq!(*ref_value_len, value.value().len());
+            }
+            drop(reference_iter);
+            for x in remove_from_reference {
+                reference.remove(&x);
+            }
+        }
+        FuzzOperation::RetainIn { start_key, len, modulus } => {
+            let start = start_key.value;
+            let end = start + len.value;
+            let modulus = modulus.value;
+            table.retain_in(start..end, |x, _| x % modulus == 0)?;
+            reference.retain(|x, _| (*x < start || *x >= end) || *x % modulus == 0);
+        }
+        FuzzOperation::Retain { modulus } => {
+            let modulus = modulus.value;
+            table.retain(|x, _| x % modulus == 0)?;
+            reference.retain(|x, _| *x % modulus == 0);
         }
         FuzzOperation::Range {
             start_key,
@@ -470,7 +500,7 @@ fn is_simulated_io_error(err: &redb::Error) -> bool {
     }
 }
 
-fn exec_table_crash_support<T: Clone>(config: &FuzzConfig, apply: fn(WriteTransaction<'_>, &mut BTreeMap<u64, T>, &FuzzTransaction, &mut SavepointManager<T>) -> Result<(), redb::Error>) -> Result<(), redb::Error> {
+fn exec_table_crash_support<T: Clone>(config: &FuzzConfig, apply: fn(WriteTransaction, &mut BTreeMap<u64, T>, &FuzzTransaction, &mut SavepointManager<T>) -> Result<(), redb::Error>) -> Result<(), redb::Error> {
     let mut redb_file: NamedTempFile = NamedTempFile::new().unwrap();
     let backend = FuzzerBackend::new(FileBackend::new(redb_file.as_file().try_clone().unwrap())?);
     let countdown = backend.countdown.clone();
@@ -642,7 +672,7 @@ fn handle_savepoints<T: Clone>(mut txn: WriteTransaction, reference: &mut BTreeM
 
 }
 
-fn apply_crashable_transaction_multimap(txn: WriteTransaction<'_>, uncommitted_reference: &mut BTreeMap<u64, BTreeSet<usize>>, transaction: &FuzzTransaction, savepoints: &mut SavepointManager<BTreeSet<usize>>) -> Result<(), redb::Error> {
+fn apply_crashable_transaction_multimap(txn: WriteTransaction, uncommitted_reference: &mut BTreeMap<u64, BTreeSet<usize>>, transaction: &FuzzTransaction, savepoints: &mut SavepointManager<BTreeSet<usize>>) -> Result<(), redb::Error> {
     {
         let mut table = txn.open_multimap_table(MULTIMAP_TABLE_DEF)?;
         for op in transaction.ops.iter() {
@@ -662,7 +692,7 @@ fn apply_crashable_transaction_multimap(txn: WriteTransaction<'_>, uncommitted_r
     Ok(())
 }
 
-fn apply_crashable_transaction(txn: WriteTransaction<'_>, uncommitted_reference: &mut BTreeMap<u64, usize>, transaction: &FuzzTransaction, savepoints: &mut SavepointManager<usize>) -> Result<(), redb::Error> {
+fn apply_crashable_transaction(txn: WriteTransaction, uncommitted_reference: &mut BTreeMap<u64, usize>, transaction: &FuzzTransaction, savepoints: &mut SavepointManager<usize>) -> Result<(), redb::Error> {
     {
         let mut table = txn.open_table(TABLE_DEF)?;
         for op in transaction.ops.iter() {
@@ -687,10 +717,12 @@ fn assert_multimap_value_eq(
     reference: Option<&BTreeSet<usize>>,
 ) -> Result<(), redb::Error> {
     if let Some(values) = reference {
+        assert_eq!(values.len() as u64, iter.len());
         for value in values.iter() {
             assert_eq!(iter.next().unwrap()?.value().len(), *value);
         }
     }
+    assert!(iter.is_empty());
     // This is basically assert!(iter.next().is_none()), but we also allow an Err such as a simulated IO error
     if let Some(Ok(_))  = iter.next() {
         panic!();

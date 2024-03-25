@@ -1,13 +1,12 @@
 use crate::transaction_tracker::{SavepointId, TransactionId, TransactionTracker};
 use crate::tree_store::{
-    AllPageNumbersBtreeIter, BtreeRangeIter, Checksum, FreedPageList, FreedTableKey,
-    InternalTableDefinition, PageHint, PageNumber, RawBtree, SerializedSavepoint, TableTree,
+    AllPageNumbersBtreeIter, BtreeHeader, BtreeRangeIter, FreedPageList, FreedTableKey,
+    InternalTableDefinition, PageHint, PageNumber, RawBtree, SerializedSavepoint, TableTreeMut,
     TableType, TransactionalMemory, PAGE_SIZE,
 };
-use crate::types::{RedbKey, RedbValue};
+use crate::types::{Key, Value};
 use crate::{
-    CompactionError, DatabaseError, Durability, ReadOnlyTable, ReadableTable, SavepointError,
-    StorageError,
+    CompactionError, DatabaseError, Durability, ReadOnlyTable, SavepointError, StorageError,
 };
 use crate::{ReadTransaction, Result, WriteTransaction};
 use std::fmt::{Debug, Display, Formatter};
@@ -18,8 +17,7 @@ use std::io::ErrorKind;
 use std::marker::PhantomData;
 use std::ops::RangeFull;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
 use crate::error::TransactionError;
 use crate::multimap_table::{parse_subtree_roots, DynamicCollection};
@@ -54,23 +52,6 @@ pub trait StorageBackend: 'static + Debug + Send + Sync {
 
     /// Writes the specified array to the storage.
     fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), io::Error>;
-}
-
-struct AtomicTransactionId {
-    inner: AtomicU64,
-}
-
-impl AtomicTransactionId {
-    fn new(last_id: TransactionId) -> Self {
-        Self {
-            inner: AtomicU64::new(last_id.raw_id()),
-        }
-    }
-
-    fn next(&self) -> TransactionId {
-        let id = self.inner.fetch_add(1, Ordering::AcqRel);
-        TransactionId::new(id)
-    }
 }
 
 pub trait TableHandle: Sealed {
@@ -127,13 +108,13 @@ impl Sealed for UntypedMultimapTableHandle {}
 ///
 /// Note that the lifetime of the `K` and `V` type parameters does not impact the lifetimes of the data
 /// that is stored or retreived from the table
-pub struct TableDefinition<'a, K: RedbKey + 'static, V: RedbValue + 'static> {
+pub struct TableDefinition<'a, K: Key + 'static, V: Value + 'static> {
     name: &'a str,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
 }
 
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> TableDefinition<'a, K, V> {
+impl<'a, K: Key + 'static, V: Value + 'static> TableDefinition<'a, K, V> {
     /// Construct a new table with given `name`
     ///
     /// ## Invariant
@@ -149,23 +130,23 @@ impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> TableDefinition<'a, K, V>
     }
 }
 
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> TableHandle for TableDefinition<'a, K, V> {
+impl<'a, K: Key + 'static, V: Value + 'static> TableHandle for TableDefinition<'a, K, V> {
     fn name(&self) -> &str {
         self.name
     }
 }
 
-impl<K: RedbKey, V: RedbValue> Sealed for TableDefinition<'_, K, V> {}
+impl<K: Key, V: Value> Sealed for TableDefinition<'_, K, V> {}
 
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> Clone for TableDefinition<'a, K, V> {
+impl<'a, K: Key + 'static, V: Value + 'static> Clone for TableDefinition<'a, K, V> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> Copy for TableDefinition<'a, K, V> {}
+impl<'a, K: Key + 'static, V: Value + 'static> Copy for TableDefinition<'a, K, V> {}
 
-impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> Display for TableDefinition<'a, K, V> {
+impl<'a, K: Key + 'static, V: Value + 'static> Display for TableDefinition<'a, K, V> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -185,13 +166,13 @@ impl<'a, K: RedbKey + 'static, V: RedbValue + 'static> Display for TableDefiniti
 ///
 /// Note that the lifetime of the `K` and `V` type parameters does not impact the lifetimes of the data
 /// that is stored or retreived from the table
-pub struct MultimapTableDefinition<'a, K: RedbKey + 'static, V: RedbKey + 'static> {
+pub struct MultimapTableDefinition<'a, K: Key + 'static, V: Key + 'static> {
     name: &'a str,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
 }
 
-impl<'a, K: RedbKey + 'static, V: RedbKey + 'static> MultimapTableDefinition<'a, K, V> {
+impl<'a, K: Key + 'static, V: Key + 'static> MultimapTableDefinition<'a, K, V> {
     pub const fn new(name: &'a str) -> Self {
         assert!(!name.is_empty());
         Self {
@@ -202,7 +183,7 @@ impl<'a, K: RedbKey + 'static, V: RedbKey + 'static> MultimapTableDefinition<'a,
     }
 }
 
-impl<'a, K: RedbKey + 'static, V: RedbKey + 'static> MultimapTableHandle
+impl<'a, K: Key + 'static, V: Key + 'static> MultimapTableHandle
     for MultimapTableDefinition<'a, K, V>
 {
     fn name(&self) -> &str {
@@ -210,17 +191,17 @@ impl<'a, K: RedbKey + 'static, V: RedbKey + 'static> MultimapTableHandle
     }
 }
 
-impl<K: RedbKey, V: RedbKey> Sealed for MultimapTableDefinition<'_, K, V> {}
+impl<K: Key, V: Key> Sealed for MultimapTableDefinition<'_, K, V> {}
 
-impl<'a, K: RedbKey + 'static, V: RedbKey + 'static> Clone for MultimapTableDefinition<'a, K, V> {
+impl<'a, K: Key + 'static, V: Key + 'static> Clone for MultimapTableDefinition<'a, K, V> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, K: RedbKey + 'static, V: RedbKey + 'static> Copy for MultimapTableDefinition<'a, K, V> {}
+impl<'a, K: Key + 'static, V: Key + 'static> Copy for MultimapTableDefinition<'a, K, V> {}
 
-impl<'a, K: RedbKey + 'static, V: RedbKey + 'static> Display for MultimapTableDefinition<'a, K, V> {
+impl<'a, K: Key + 'static, V: Key + 'static> Display for MultimapTableDefinition<'a, K, V> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -229,6 +210,74 @@ impl<'a, K: RedbKey + 'static, V: RedbKey + 'static> Display for MultimapTableDe
             K::type_name().name(),
             V::type_name().name()
         )
+    }
+}
+
+pub(crate) struct TransactionGuard {
+    transaction_tracker: Option<Arc<TransactionTracker>>,
+    transaction_id: Option<TransactionId>,
+    write_transaction: bool,
+}
+
+impl TransactionGuard {
+    pub(crate) fn new_read(
+        transaction_id: TransactionId,
+        tracker: Arc<TransactionTracker>,
+    ) -> Self {
+        Self {
+            transaction_tracker: Some(tracker),
+            transaction_id: Some(transaction_id),
+            write_transaction: false,
+        }
+    }
+
+    pub(crate) fn new_write(
+        transaction_id: TransactionId,
+        tracker: Arc<TransactionTracker>,
+    ) -> Self {
+        Self {
+            transaction_tracker: Some(tracker),
+            transaction_id: Some(transaction_id),
+            write_transaction: true,
+        }
+    }
+
+    // TODO: remove this hack
+    pub(crate) fn fake() -> Self {
+        Self {
+            transaction_tracker: None,
+            transaction_id: None,
+            write_transaction: false,
+        }
+    }
+
+    pub(crate) fn id(&self) -> TransactionId {
+        self.transaction_id.unwrap()
+    }
+
+    pub(crate) fn leak(mut self) -> TransactionId {
+        self.transaction_id.take().unwrap()
+    }
+}
+
+impl Drop for TransactionGuard {
+    fn drop(&mut self) {
+        if self.transaction_tracker.is_none() {
+            return;
+        }
+        if let Some(transaction_id) = self.transaction_id {
+            if self.write_transaction {
+                self.transaction_tracker
+                    .as_ref()
+                    .unwrap()
+                    .end_write_transaction(transaction_id);
+            } else {
+                self.transaction_tracker
+                    .as_ref()
+                    .unwrap()
+                    .deallocate_read_transaction(transaction_id);
+            }
+        }
     }
 }
 
@@ -263,11 +312,8 @@ impl<'a, K: RedbKey + 'static, V: RedbKey + 'static> Display for MultimapTableDe
 /// # }
 /// ```
 pub struct Database {
-    mem: TransactionalMemory,
-    next_transaction_id: AtomicTransactionId,
-    transaction_tracker: Arc<Mutex<TransactionTracker>>,
-    live_write_transaction: Mutex<Option<TransactionId>>,
-    live_write_transaction_available: Condvar,
+    mem: Arc<TransactionalMemory>,
+    transaction_tracker: Arc<TransactionTracker>,
 }
 
 impl Database {
@@ -284,53 +330,38 @@ impl Database {
         Self::builder().open(path)
     }
 
-    pub(crate) fn start_write_transaction(&self) -> TransactionId {
-        let mut live_write_transaction = self.live_write_transaction.lock().unwrap();
-        while live_write_transaction.is_some() {
-            live_write_transaction = self
-                .live_write_transaction_available
-                .wait(live_write_transaction)
-                .unwrap();
-        }
-        assert!(live_write_transaction.is_none());
-        let transaction_id = self.next_transaction_id.next();
-        #[cfg(feature = "logging")]
-        info!("Beginning write transaction id={:?}", transaction_id);
-        *live_write_transaction = Some(transaction_id);
-
-        transaction_id
+    pub(crate) fn get_memory(&self) -> Arc<TransactionalMemory> {
+        self.mem.clone()
     }
 
-    pub(crate) fn end_write_transaction(&self, id: TransactionId) {
-        let mut live_write_transaction = self.live_write_transaction.lock().unwrap();
-        assert_eq!(live_write_transaction.unwrap(), id);
-        *live_write_transaction = None;
-        self.live_write_transaction_available.notify_one();
-    }
-
-    pub(crate) fn get_memory(&self) -> &TransactionalMemory {
-        &self.mem
-    }
-
-    pub(crate) fn verify_primary_checksums(mem: &TransactionalMemory) -> Result<bool> {
+    pub(crate) fn verify_primary_checksums(mem: Arc<TransactionalMemory>) -> Result<bool> {
         let fake_freed_pages = Arc::new(Mutex::new(vec![]));
-        let table_tree = TableTree::new(mem.get_data_root(), mem, fake_freed_pages.clone());
+        let table_tree = TableTreeMut::new(
+            mem.get_data_root(),
+            Arc::new(TransactionGuard::fake()),
+            mem.clone(),
+            fake_freed_pages.clone(),
+        );
         if !table_tree.verify_checksums()? {
             return Ok(false);
         }
-        let system_table_tree =
-            TableTree::new(mem.get_system_root(), mem, fake_freed_pages.clone());
+        let system_table_tree = TableTreeMut::new(
+            mem.get_system_root(),
+            Arc::new(TransactionGuard::fake()),
+            mem.clone(),
+            fake_freed_pages.clone(),
+        );
         if !system_table_tree.verify_checksums()? {
             return Ok(false);
         }
         assert!(fake_freed_pages.lock().unwrap().is_empty());
 
-        if let Some((freed_root, freed_checksum)) = mem.get_freed_root() {
+        if let Some(header) = mem.get_freed_root() {
             if !RawBtree::new(
-                Some((freed_root, freed_checksum)),
+                Some(header),
                 FreedTableKey::fixed_width(),
                 FreedPageList::fixed_width(),
-                mem,
+                mem.clone(),
             )
             .verify_checksum()?
             {
@@ -341,24 +372,35 @@ impl Database {
         Ok(true)
     }
 
-    /// Check the integrity of the database file, and repair it if possible.
+    /// Force a check of the integrity of the database file, and repair it if possible.
+    ///
+    /// Note: Calling this function is unnecessary during normal operation. redb will automatically
+    /// detect and recover from crashes, power loss, and other unclean shutdowns. This function is
+    /// quite slow and should only be used when you suspect the database file may have been modified
+    /// externally to redb, or that a redb bug may have left the database in a corrupted state.
     ///
     /// Returns `Ok(true)` if the database passed integrity checks; `Ok(false)` if it failed but was repaired,
     /// and `Err(Corrupted)` if the check failed and the file could not be repaired
-    pub fn check_integrity(&mut self) -> Result<bool> {
-        self.mem.clear_cache_and_reload()?;
+    pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
+        let allocator_hash = self.mem.allocator_hash();
+        let mut was_clean = Arc::get_mut(&mut self.mem)
+            .unwrap()
+            .clear_cache_and_reload()?;
 
-        if !self.mem.needs_repair()? && Self::verify_primary_checksums(&self.mem)? {
-            return Ok(true);
+        if !Self::verify_primary_checksums(self.mem.clone())? {
+            was_clean = false;
         }
 
         Self::do_repair(&mut self.mem, &|_| {}).map_err(|err| match err {
             DatabaseError::Storage(storage_err) => storage_err,
             _ => unreachable!(),
         })?;
+        if allocator_hash != self.mem.allocator_hash() {
+            was_clean = false;
+        }
         self.mem.begin_writable()?;
 
-        Ok(false)
+        Ok(was_clean)
     }
 
     /// Compacts the database file
@@ -371,12 +413,7 @@ impl Database {
         if txn.list_persistent_savepoints()?.next().is_some() {
             return Err(CompactionError::PersistentSavepointExists);
         }
-        if self
-            .transaction_tracker
-            .lock()
-            .unwrap()
-            .any_savepoint_exists()
-        {
+        if self.transaction_tracker.any_savepoint_exists() {
             return Err(CompactionError::EphemeralSavepointExists);
         }
         txn.set_durability(Durability::Paranoid);
@@ -419,13 +456,18 @@ impl Database {
     }
 
     fn mark_persistent_savepoints(
-        system_root: Option<(PageNumber, Checksum)>,
-        mem: &TransactionalMemory,
+        system_root: Option<BtreeHeader>,
+        mem: Arc<TransactionalMemory>,
         oldest_unprocessed_free_transaction: TransactionId,
     ) -> Result {
         let freed_list = Arc::new(Mutex::new(vec![]));
-        let table_tree = TableTree::new(system_root, mem, freed_list);
-        let fake_transaction_tracker = Arc::new(Mutex::new(TransactionTracker::new()));
+        let table_tree = TableTreeMut::new(
+            system_root,
+            Arc::new(TransactionGuard::fake()),
+            mem.clone(),
+            freed_list,
+        );
+        let fake_transaction_tracker = Arc::new(TransactionTracker::new(TransactionId::new(0)));
         if let Some(savepoint_table_def) = table_tree
             .get_table::<SavepointId, SerializedSavepoint>(
                 SAVEPOINT_TABLE.name(),
@@ -440,19 +482,20 @@ impl Database {
                     "internal savepoint table".to_string(),
                     savepoint_table_def.get_root(),
                     PageHint::None,
-                    mem,
+                    Arc::new(TransactionGuard::fake()),
+                    mem.clone(),
                 )?;
             for result in savepoint_table.range::<SavepointId>(..)? {
                 let (_, savepoint_data) = result?;
                 let savepoint = savepoint_data
                     .value()
                     .to_savepoint(fake_transaction_tracker.clone());
-                if let Some((root, _)) = savepoint.get_user_root() {
-                    Self::mark_tables_recursive(root, mem, true)?;
+                if let Some(header) = savepoint.get_user_root() {
+                    Self::mark_tables_recursive(header.root, mem.clone(), true)?;
                 }
                 Self::mark_freed_tree(
                     savepoint.get_freed_root(),
-                    mem,
+                    mem.clone(),
                     oldest_unprocessed_free_transaction,
                 )?;
             }
@@ -462,16 +505,16 @@ impl Database {
     }
 
     fn mark_freed_tree(
-        freed_root: Option<(PageNumber, Checksum)>,
-        mem: &TransactionalMemory,
+        freed_root: Option<BtreeHeader>,
+        mem: Arc<TransactionalMemory>,
         oldest_unprocessed_free_transaction: TransactionId,
     ) -> Result {
-        if let Some((root, _)) = freed_root {
+        if let Some(header) = freed_root {
             let freed_pages_iter = AllPageNumbersBtreeIter::new(
-                root,
+                header.root,
                 FreedTableKey::fixed_width(),
                 FreedPageList::fixed_width(),
-                mem,
+                mem.clone(),
             )?;
             mem.mark_pages_allocated(freed_pages_iter, true)?;
         }
@@ -480,7 +523,8 @@ impl Database {
             "internal freed table".to_string(),
             freed_root,
             PageHint::None,
-            mem,
+            Arc::new(TransactionGuard::fake()),
+            mem.clone(),
         )?;
         let lookup_key = FreedTableKey {
             transaction_id: oldest_unprocessed_free_transaction.raw_id(),
@@ -500,50 +544,50 @@ impl Database {
 
     fn mark_tables_recursive(
         root: PageNumber,
-        mem: &TransactionalMemory,
+        mem: Arc<TransactionalMemory>,
         allow_duplicates: bool,
     ) -> Result {
         // Repair the allocator state
         // All pages in the master table
-        let master_pages_iter = AllPageNumbersBtreeIter::new(root, None, None, mem)?;
+        let master_pages_iter = AllPageNumbersBtreeIter::new(root, None, None, mem.clone())?;
         mem.mark_pages_allocated(master_pages_iter, allow_duplicates)?;
 
         // Iterate over all other tables
         let iter: BtreeRangeIter<&str, InternalTableDefinition> =
-            BtreeRangeIter::new::<RangeFull, &str>(&(..), Some(root), mem)?;
+            BtreeRangeIter::new::<RangeFull, &str>(&(..), Some(root), mem.clone())?;
 
         // Chain all the other tables to the master table iter
         for entry in iter {
             let definition = entry?.value();
-            if let Some((table_root, _)) = definition.get_root() {
+            if let Some(header) = definition.get_root() {
                 match definition.get_type() {
                     TableType::Normal => {
                         let table_pages_iter = AllPageNumbersBtreeIter::new(
-                            table_root,
+                            header.root,
                             definition.get_fixed_key_size(),
                             definition.get_fixed_value_size(),
-                            mem,
+                            mem.clone(),
                         )?;
                         mem.mark_pages_allocated(table_pages_iter, allow_duplicates)?;
                     }
                     TableType::Multimap => {
                         let table_pages_iter = AllPageNumbersBtreeIter::new(
-                            table_root,
+                            header.root,
                             definition.get_fixed_key_size(),
                             DynamicCollection::<()>::fixed_width_with(
                                 definition.get_fixed_value_size(),
                             ),
-                            mem,
+                            mem.clone(),
                         )?;
                         mem.mark_pages_allocated(table_pages_iter, allow_duplicates)?;
 
                         let table_pages_iter = AllPageNumbersBtreeIter::new(
-                            table_root,
+                            header.root,
                             definition.get_fixed_key_size(),
                             DynamicCollection::<()>::fixed_width_with(
                                 definition.get_fixed_value_size(),
                             ),
-                            mem,
+                            mem.clone(),
                         )?;
                         for table_page in table_pages_iter {
                             let page = mem.get_page(table_page?)?;
@@ -552,12 +596,12 @@ impl Database {
                                 definition.get_fixed_key_size(),
                                 definition.get_fixed_value_size(),
                             );
-                            for (sub_root, _) in subtree_roots {
+                            for subtree_header in subtree_roots {
                                 let sub_root_iter = AllPageNumbersBtreeIter::new(
-                                    sub_root,
+                                    subtree_header.root,
                                     definition.get_fixed_value_size(),
                                     <()>::fixed_width(),
-                                    mem,
+                                    mem.clone(),
                                 )?;
                                 mem.mark_pages_allocated(sub_root_iter, allow_duplicates)?;
                             }
@@ -571,10 +615,10 @@ impl Database {
     }
 
     fn do_repair(
-        mem: &mut TransactionalMemory,
+        mem: &mut Arc<TransactionalMemory>, // Only &mut to ensure exclusivity
         repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
     ) -> Result<(), DatabaseError> {
-        if !Self::verify_primary_checksums(mem)? {
+        if !Self::verify_primary_checksums(mem.clone())? {
             // 0.3 because the repair takes 3 full scans and the first is done now
             let mut handle = RepairSession::new(0.3);
             repair_callback(&mut handle);
@@ -587,7 +631,7 @@ impl Database {
             // have poisoned it with pages that just got rolled back by repair_primary_corrupted(), since
             // that rolls back a partially committed transaction.
             mem.clear_read_cache();
-            if !Self::verify_primary_checksums(mem)? {
+            if !Self::verify_primary_checksums(mem.clone())? {
                 return Err(DatabaseError::Storage(StorageError::Corrupted(
                     "Failed to repair database. All roots are corrupted".to_string(),
                 )));
@@ -603,18 +647,19 @@ impl Database {
         mem.begin_repair()?;
 
         let data_root = mem.get_data_root();
-        if let Some((root, _)) = data_root {
-            Self::mark_tables_recursive(root, mem, false)?;
+        if let Some(header) = data_root {
+            Self::mark_tables_recursive(header.root, mem.clone(), false)?;
         }
 
         let freed_root = mem.get_freed_root();
         // Allow processing of all transactions, since this is the main freed tree
-        Self::mark_freed_tree(freed_root, mem, TransactionId::new(0))?;
+        Self::mark_freed_tree(freed_root, mem.clone(), TransactionId::new(0))?;
         let freed_table: ReadOnlyTable<FreedTableKey, FreedPageList<'static>> = ReadOnlyTable::new(
             "internal freed table".to_string(),
             freed_root,
             PageHint::None,
-            mem,
+            Arc::new(TransactionGuard::fake()),
+            mem.clone(),
         )?;
         // The persistent savepoints might hold references to older freed trees that are partially processed.
         // Make sure we don't reprocess those frees, as that would result in a double-free
@@ -634,10 +679,10 @@ impl Database {
         }
 
         let system_root = mem.get_system_root();
-        if let Some((root, _)) = system_root {
-            Self::mark_tables_recursive(root, mem, false)?;
+        if let Some(header) = system_root {
+            Self::mark_tables_recursive(header.root, mem.clone(), false)?;
         }
-        Self::mark_persistent_savepoints(system_root, mem, oldest_unprocessed_transaction)?;
+        Self::mark_persistent_savepoints(system_root, mem.clone(), oldest_unprocessed_transaction)?;
 
         mem.end_repair()?;
 
@@ -670,13 +715,14 @@ impl Database {
         let file_path = format!("{:?}", &file);
         #[cfg(feature = "logging")]
         info!("Opening database {:?}", &file_path);
-        let mut mem = TransactionalMemory::new(
+        let mem = TransactionalMemory::new(
             file,
             page_size,
             region_size,
             read_cache_size_bytes,
             write_cache_size_bytes,
         )?;
+        let mut mem = Arc::new(mem);
         if mem.needs_repair()? {
             #[cfg(feature = "logging")]
             warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
@@ -693,18 +739,13 @@ impl Database {
 
         let db = Database {
             mem,
-            next_transaction_id: AtomicTransactionId::new(next_transaction_id),
-            transaction_tracker: Arc::new(Mutex::new(TransactionTracker::new())),
-            live_write_transaction: Mutex::new(None),
-            live_write_transaction_available: Condvar::new(),
+            transaction_tracker: Arc::new(TransactionTracker::new(next_transaction_id)),
         };
 
         // Restore the tracker state for any persistent savepoints
         let txn = db.begin_write().map_err(|e| e.into_storage_error())?;
         if let Some(next_id) = txn.next_persistent_savepoint_id()? {
             db.transaction_tracker
-                .lock()
-                .unwrap()
                 .restore_savepoint_counter_state(next_id);
         }
         for id in txn.list_persistent_savepoints()? {
@@ -718,8 +759,6 @@ impl Database {
                 },
             };
             db.transaction_tracker
-                .lock()
-                .unwrap()
                 .register_persistent_savepoint(&savepoint);
         }
         txn.abort()?;
@@ -727,21 +766,15 @@ impl Database {
         Ok(db)
     }
 
-    fn allocate_read_transaction(&self) -> Result<TransactionId> {
-        let mut guard = self.transaction_tracker.lock().unwrap();
-        let id = self.mem.get_last_committed_transaction_id()?;
-        guard.register_read_transaction(id);
-
-        Ok(id)
-    }
-
-    pub(crate) fn allocate_savepoint(&self) -> Result<(SavepointId, TransactionId)> {
+    fn allocate_read_transaction(&self) -> Result<TransactionGuard> {
         let id = self
             .transaction_tracker
-            .lock()
-            .unwrap()
-            .allocate_savepoint();
-        Ok((id, self.allocate_read_transaction()?))
+            .register_read_transaction(&self.mem)?;
+
+        Ok(TransactionGuard::new_read(
+            id,
+            self.transaction_tracker.clone(),
+        ))
     }
 
     /// Convenience method for [`Builder::new`]
@@ -755,7 +788,12 @@ impl Database {
     /// write may be in progress at a time. If a write is in progress, this function will block
     /// until it completes.
     pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
-        WriteTransaction::new(self, self.transaction_tracker.clone()).map_err(|e| e.into())
+        let guard = TransactionGuard::new_write(
+            self.transaction_tracker.start_write_transaction(),
+            self.transaction_tracker.clone(),
+        );
+        WriteTransaction::new(guard, self.transaction_tracker.clone(), self.mem.clone())
+            .map_err(|e| e.into())
     }
 
     /// Begins a read transaction
@@ -766,14 +804,10 @@ impl Database {
     /// Returns a [`ReadTransaction`] which may be used to read from the database. Read transactions
     /// may exist concurrently with writes
     pub fn begin_read(&self) -> Result<ReadTransaction, TransactionError> {
-        let id = self.allocate_read_transaction()?;
+        let guard = self.allocate_read_transaction()?;
         #[cfg(feature = "logging")]
-        info!("Beginning read transaction id={:?}", id);
-        Ok(ReadTransaction::new(
-            self.get_memory(),
-            self.transaction_tracker.clone(),
-            id,
-        ))
+        info!("Beginning read transaction id={:?}", guard.id());
+        ReadTransaction::new(self.get_memory(), guard)
     }
 }
 

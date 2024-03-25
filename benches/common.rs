@@ -1,5 +1,4 @@
-use redb::TableDefinition;
-use redb::{AccessGuard, ReadableTable};
+use redb::{AccessGuard, ReadableTableMetadata, TableDefinition};
 use rocksdb::{Direction, IteratorMode, TransactionDB, TransactionOptions, WriteOptions};
 use sanakirja::btree::page_unsized;
 use sanakirja::{Commit, RootDb};
@@ -52,6 +51,7 @@ pub trait BenchReadTransaction {
     fn get_reader(&self) -> Self::T<'_>;
 }
 
+#[allow(clippy::len_without_is_empty)]
 pub trait BenchReader {
     type Output<'out>: AsRef<[u8]> + 'out
     where
@@ -63,6 +63,8 @@ pub trait BenchReader {
     fn get<'a>(&'a self, key: &[u8]) -> Option<Self::Output<'a>>;
 
     fn range_from<'a>(&'a self, start: &'a [u8]) -> Self::Iterator<'a>;
+
+    fn len(&self) -> u64;
 }
 
 pub trait BenchIterator {
@@ -85,8 +87,8 @@ impl<'a> RedbBenchDatabase<'a> {
 }
 
 impl<'a> BenchDatabase for RedbBenchDatabase<'a> {
-    type W<'db> = RedbBenchWriteTransaction<'db> where Self: 'db;
-    type R<'db> = RedbBenchReadTransaction<'db> where Self: 'db;
+    type W<'db> = RedbBenchWriteTransaction where Self: 'db;
+    type R<'db> = RedbBenchReadTransaction where Self: 'db;
 
     fn db_type_name() -> &'static str {
         "redb"
@@ -103,12 +105,12 @@ impl<'a> BenchDatabase for RedbBenchDatabase<'a> {
     }
 }
 
-pub struct RedbBenchReadTransaction<'db> {
-    txn: redb::ReadTransaction<'db>,
+pub struct RedbBenchReadTransaction {
+    txn: redb::ReadTransaction,
 }
 
-impl<'db> BenchReadTransaction for RedbBenchReadTransaction<'db> {
-    type T<'txn> = RedbBenchReader<'txn> where Self: 'txn;
+impl BenchReadTransaction for RedbBenchReadTransaction {
+    type T<'txn> = RedbBenchReader where Self: 'txn;
 
     fn get_reader(&self) -> Self::T<'_> {
         let table = self.txn.open_table(X).unwrap();
@@ -116,11 +118,11 @@ impl<'db> BenchReadTransaction for RedbBenchReadTransaction<'db> {
     }
 }
 
-pub struct RedbBenchReader<'txn> {
-    table: redb::ReadOnlyTable<'txn, &'static [u8], &'static [u8]>,
+pub struct RedbBenchReader {
+    table: redb::ReadOnlyTable<&'static [u8], &'static [u8]>,
 }
 
-impl<'txn> BenchReader for RedbBenchReader<'txn> {
+impl BenchReader for RedbBenchReader {
     type Output<'out> = RedbAccessGuard<'out> where Self: 'out;
     type Iterator<'out> = RedbBenchIterator<'out> where Self: 'out;
 
@@ -131,6 +133,10 @@ impl<'txn> BenchReader for RedbBenchReader<'txn> {
     fn range_from<'a>(&'a self, key: &'a [u8]) -> Self::Iterator<'a> {
         let iter = self.table.range(key..).unwrap();
         RedbBenchIterator { iter }
+    }
+
+    fn len(&self) -> u64 {
+        self.table.len().unwrap()
     }
 }
 
@@ -150,11 +156,11 @@ impl BenchIterator for RedbBenchIterator<'_> {
 }
 
 pub struct RedbAccessGuard<'a> {
-    inner: AccessGuard<'a, &'a [u8]>,
+    inner: AccessGuard<'a, &'static [u8]>,
 }
 
 impl<'a> RedbAccessGuard<'a> {
-    fn new(inner: AccessGuard<'a, &'a [u8]>) -> Self {
+    fn new(inner: AccessGuard<'a, &'static [u8]>) -> Self {
         Self { inner }
     }
 }
@@ -165,12 +171,12 @@ impl<'a> AsRef<[u8]> for RedbAccessGuard<'a> {
     }
 }
 
-pub struct RedbBenchWriteTransaction<'db> {
-    txn: redb::WriteTransaction<'db>,
+pub struct RedbBenchWriteTransaction {
+    txn: redb::WriteTransaction,
 }
 
-impl<'db> BenchWriteTransaction for RedbBenchWriteTransaction<'db> {
-    type W<'txn> = RedbBenchInserter<'db, 'txn> where Self: 'txn;
+impl BenchWriteTransaction for RedbBenchWriteTransaction {
+    type W<'txn> = RedbBenchInserter<'txn> where Self: 'txn;
 
     fn get_inserter(&mut self) -> Self::W<'_> {
         let table = self.txn.open_table(X).unwrap();
@@ -182,11 +188,11 @@ impl<'db> BenchWriteTransaction for RedbBenchWriteTransaction<'db> {
     }
 }
 
-pub struct RedbBenchInserter<'db, 'txn> {
-    table: redb::Table<'db, 'txn, &'static [u8], &'static [u8]>,
+pub struct RedbBenchInserter<'txn> {
+    table: redb::Table<'txn, &'static [u8], &'static [u8]>,
 }
 
-impl BenchInserter for RedbBenchInserter<'_, '_> {
+impl BenchInserter for RedbBenchInserter<'_> {
     fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), ()> {
         self.table.insert(key, value).map(|_| ()).map_err(|_| ())
     }
@@ -254,6 +260,10 @@ impl<'db> BenchReader for SledBenchReader<'db> {
     fn range_from<'a>(&'a self, key: &'a [u8]) -> Self::Iterator<'a> {
         let iter = self.db.range(key..);
         SledBenchIterator { iter }
+    }
+
+    fn len(&self) -> u64 {
+        self.db.len() as u64
     }
 }
 
@@ -416,6 +426,11 @@ impl<'txn, 'db> BenchReader for LmdbRkvBenchReader<'txn, 'db> {
 
         LmdbRkvBenchIterator { iter }
     }
+
+    fn len(&self) -> u64 {
+        use lmdb::Transaction;
+        self.txn.stat(self.db).unwrap().entries() as u64
+    }
 }
 
 pub struct LmdbRkvBenchIterator<'a> {
@@ -526,6 +541,10 @@ impl<'db, 'txn> BenchReader for RocksdbBenchReader<'db, 'txn> {
 
         RocksdbBenchIterator { iter }
     }
+
+    fn len(&self) -> u64 {
+        self.snapshot.iterator(IteratorMode::Start).count() as u64
+    }
 }
 
 pub struct RocksdbBenchIterator<'a> {
@@ -551,10 +570,12 @@ impl<'a> SanakirjaBenchDatabase<'a> {
     #[allow(dead_code)]
     pub fn new(db: &'a sanakirja::Env) -> Self {
         let mut txn = sanakirja::Env::mut_txn_begin(db).unwrap();
-        let table =
+        // XXX: There's no documentation on why this method is unsafe, so let's just hope we upheld the requirements for it to be safe!
+        let table = unsafe {
             sanakirja::btree::create_db_::<_, [u8], [u8], page_unsized::Page<[u8], [u8]>>(&mut txn)
-                .unwrap();
-        txn.set_root(0, table.db);
+                .unwrap()
+        };
+        txn.set_root(0, table.db.into());
         txn.commit().unwrap();
         Self { db }
     }
@@ -610,7 +631,7 @@ impl BenchInserter for SanakirjaBenchInserter<'_, '_> {
         let result = sanakirja::btree::put(self.txn, &mut self.table, key, value)
             .map_err(|_| ())
             .map(|_| ());
-        self.txn.set_root(0, self.table.db);
+        self.txn.set_root(0, self.table.db.into());
         result
     }
 
@@ -618,7 +639,7 @@ impl BenchInserter for SanakirjaBenchInserter<'_, '_> {
         let result = sanakirja::btree::del(self.txn, &mut self.table, key, None)
             .map_err(|_| ())
             .map(|_| ());
-        self.txn.set_root(0, self.table.db);
+        self.txn.set_root(0, self.table.db.into());
         result
     }
 }
@@ -659,6 +680,12 @@ impl<'db, 'txn> BenchReader for SanakirjaBenchReader<'db, 'txn> {
         let iter = sanakirja::btree::iter(self.txn, &self.table, Some((key, None))).unwrap();
 
         SanakirjaBenchIterator { iter }
+    }
+
+    fn len(&self) -> u64 {
+        sanakirja::btree::iter(self.txn, &self.table, None)
+            .unwrap()
+            .count() as u64
     }
 }
 

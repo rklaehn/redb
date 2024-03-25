@@ -1,5 +1,5 @@
 use crate::transaction_tracker::TransactionId;
-use crate::tree_store::btree_base::Checksum;
+use crate::tree_store::btree_base::{BtreeHeader, Checksum};
 use crate::tree_store::page_store::base::{PageHint, MAX_PAGE_INDEX};
 use crate::tree_store::page_store::buddy_allocator::BuddyAllocator;
 use crate::tree_store::page_store::cached_file::{CachePriority, PagedCachedFile};
@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::convert::TryInto;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(debug_assertions)]
+use std::sync::Arc;
 use std::sync::Mutex;
 
 // Regions have a maximum size of 4GiB. A `4GiB - overhead` value is the largest that can be represented,
@@ -30,7 +32,10 @@ const MIN_DESIRED_USABLE_BYTES: u64 = 1024 * 1024;
 
 pub(super) const INITIAL_REGIONS: u32 = 1000; // Enough for a 4TiB database
 
-pub(crate) const FILE_FORMAT_VERSION: u8 = 1;
+// Original file format. No lengths stored with btrees
+pub(crate) const FILE_FORMAT_VERSION1: u8 = 1;
+// New file format. All btrees have a separate length stored in their header for constant time access
+pub(crate) const FILE_FORMAT_VERSION2: u8 = 2;
 
 fn ceil_log2(x: usize) -> u8 {
     if x.is_power_of_two() {
@@ -82,10 +87,10 @@ pub(crate) struct TransactionalMemory {
     state: Mutex<InMemoryState>,
     // The number of PageMut which are outstanding
     #[cfg(debug_assertions)]
-    open_dirty_pages: Mutex<HashSet<PageNumber>>,
+    open_dirty_pages: Arc<Mutex<HashSet<PageNumber>>>,
     // Reference counts of PageImpls that are outstanding
     #[cfg(debug_assertions)]
-    read_page_ref_counts: Mutex<HashMap<PageNumber, u64>>,
+    read_page_ref_counts: Arc<Mutex<HashMap<PageNumber, u64>>>,
     // Indicates that a non-durable commit has been made, so reads should be served from the secondary meta page
     read_from_secondary: AtomicBool,
     page_size: u32,
@@ -171,7 +176,12 @@ impl TransactionalMemory {
                 PageNumber::new(0, page_number, required_order)
             };
 
-            let mut header = DatabaseHeader::new(layout, TransactionId::new(0), tracker_page);
+            let mut header = DatabaseHeader::new(
+                layout,
+                TransactionId::new(0),
+                FILE_FORMAT_VERSION2,
+                tracker_page,
+            );
 
             header.recovery_required = false;
             storage
@@ -190,30 +200,9 @@ impl TransactionalMemory {
             storage.flush(false)?;
         }
         let header_bytes = storage.read_direct(0, DB_HEADER_SIZE)?;
-        let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes);
+        let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes)?;
 
         assert_eq!(header.page_size() as usize, page_size);
-        let version = header.primary_slot().version;
-        if version > FILE_FORMAT_VERSION {
-            return Err(StorageError::Corrupted(format!(
-                "Expected file format version {FILE_FORMAT_VERSION}, found {version}",
-            ))
-            .into());
-        }
-        if version < FILE_FORMAT_VERSION {
-            return Err(DatabaseError::UpgradeRequired(version));
-        }
-        let version = header.secondary_slot().version;
-        if version > FILE_FORMAT_VERSION {
-            return Err(StorageError::Corrupted(format!(
-                "Expected file format version {FILE_FORMAT_VERSION}, found {version}",
-            ))
-            .into());
-        }
-        if version < FILE_FORMAT_VERSION {
-            return Err(DatabaseError::UpgradeRequired(version));
-        }
-
         assert!(storage.raw_file_len()? >= header.layout().len());
         let needs_recovery =
             header.recovery_required || header.layout().len() != storage.raw_file_len()?;
@@ -262,9 +251,9 @@ impl TransactionalMemory {
             storage,
             state: Mutex::new(state),
             #[cfg(debug_assertions)]
-            open_dirty_pages: Mutex::new(HashSet::new()),
+            open_dirty_pages: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(debug_assertions)]
-            read_page_ref_counts: Mutex::new(HashMap::new()),
+            read_page_ref_counts: Arc::new(Mutex::new(HashMap::new())),
             read_from_secondary: AtomicBool::new(false),
             page_size: page_size.try_into().unwrap(),
             region_size,
@@ -272,31 +261,25 @@ impl TransactionalMemory {
         })
     }
 
-    pub(crate) fn clear_read_cache(&mut self) {
+    pub(crate) fn clear_read_cache(&self) {
         self.storage.invalidate_cache_all()
     }
 
-    pub(crate) fn clear_cache_and_reload(&mut self) -> Result {
+    pub(crate) fn clear_cache_and_reload(&mut self) -> Result<bool, DatabaseError> {
         assert!(self.allocated_since_commit.lock().unwrap().is_empty());
 
         self.storage.flush(false)?;
         self.storage.invalidate_cache_all();
 
         let header_bytes = self.storage.read_direct(0, DB_HEADER_SIZE)?;
-        let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes);
-        // TODO: should probably consolidate this logic with Self::new()
+        let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes)?;
+        // TODO: This ends up always being true because this is called from check_integrity() once the db is already open
+        // TODO: Also we should recheck the layout
+        let mut was_clean = true;
         if header.recovery_required {
-            let layout = header.layout();
-            let region_max_pages = layout.full_region_layout().num_pages();
-            let region_header_pages = layout.full_region_layout().get_header_pages();
-            header.set_layout(DatabaseLayout::recalculate(
-                self.storage.raw_file_len()?,
-                region_header_pages,
-                region_max_pages,
-                self.page_size,
-            ));
             if repair_info.primary_corrupted {
                 header.swap_primary_slot();
+                was_clean = false;
             } else {
                 // If the secondary is a valid commit, verify that the primary is newer. This handles an edge case where:
                 // * the primary bit is flipped to the secondary
@@ -305,10 +288,11 @@ impl TransactionalMemory {
                     header.secondary_slot().transaction_id > header.primary_slot().transaction_id;
                 if secondary_newer && !repair_info.secondary_corrupted {
                     header.swap_primary_slot();
+                    was_clean = false;
                 }
             }
             if repair_info.invalid_magic_number {
-                return Err(StorageError::Corrupted("Invalid magic number".to_string()));
+                return Err(StorageError::Corrupted("Invalid magic number".to_string()).into());
             }
             self.storage
                 .write(0, DB_HEADER_SIZE, true, |_| CachePriority::High)?
@@ -319,10 +303,9 @@ impl TransactionalMemory {
 
         self.needs_recovery
             .store(header.recovery_required, Ordering::Release);
-        let state = InMemoryState::from_bytes(header.clone(), &self.storage)?;
-        *self.state.lock().unwrap() = state;
+        self.state.lock().unwrap().header = header;
 
-        Ok(())
+        Ok(was_clean)
     }
 
     pub(crate) fn begin_writable(&self) -> Result {
@@ -335,6 +318,10 @@ impl TransactionalMemory {
 
     pub(crate) fn needs_repair(&self) -> Result<bool> {
         Ok(self.state.lock().unwrap().header.recovery_required)
+    }
+
+    pub(crate) fn allocator_hash(&self) -> u128 {
+        self.state.lock().unwrap().allocators.xxh3_hash()
     }
 
     // TODO: need a clearer distinction between this and needs_repair()
@@ -385,20 +372,32 @@ impl TransactionalMemory {
         Ok(())
     }
 
-    pub(crate) fn end_repair(&mut self) -> Result<()> {
-        let state = self.state.lock().unwrap();
+    pub(crate) fn end_repair(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
         let tracker_len = state.allocators.region_tracker.to_vec().len();
-        drop(state);
-        // Allocate a new tracker page, since the old one will have been overwritten
-        let tracker_page = self
-            .allocate(tracker_len, CachePriority::High)?
-            .get_page_number();
+        let tracker_page = state.header.region_tracker();
+
+        let allocator = state.get_region_mut(tracker_page.region);
+        // Allocate a new tracker page, if the old one was overwritten or is too small
+        if allocator.is_allocated(tracker_page.page_index, tracker_page.page_order)
+            || tracker_page.page_size_bytes(self.page_size) < tracker_len as u64
+        {
+            drop(state);
+            let new_tracker_page = self
+                .allocate(tracker_len, CachePriority::High)?
+                .get_page_number();
+
+            let mut state = self.state.lock().unwrap();
+            state.header.set_region_tracker(new_tracker_page);
+            self.write_header(&state.header, false)?;
+            self.storage.flush(false)?;
+        } else {
+            allocator.record_alloc(tracker_page.page_index, tracker_page.page_order);
+            drop(state);
+        }
 
         let mut state = self.state.lock().unwrap();
-        state.header.set_region_tracker(tracker_page);
-        self.write_header(&state.header, false)?;
-        self.storage.flush(false)?;
-
+        let tracker_page = state.header.region_tracker();
         state
             .allocators
             .flush_to(tracker_page, state.header.layout(), &self.storage)?;
@@ -478,9 +477,9 @@ impl TransactionalMemory {
     // Commit all outstanding changes and make them visible as the primary
     pub(crate) fn commit(
         &self,
-        data_root: Option<(PageNumber, Checksum)>,
-        system_root: Option<(PageNumber, Checksum)>,
-        freed_root: Option<(PageNumber, Checksum)>,
+        data_root: Option<BtreeHeader>,
+        system_root: Option<BtreeHeader>,
+        freed_root: Option<BtreeHeader>,
         transaction_id: TransactionId,
         eventual: bool,
         two_phase: bool,
@@ -501,9 +500,9 @@ impl TransactionalMemory {
 
     fn commit_inner(
         &self,
-        data_root: Option<(PageNumber, Checksum)>,
-        system_root: Option<(PageNumber, Checksum)>,
-        freed_root: Option<(PageNumber, Checksum)>,
+        data_root: Option<BtreeHeader>,
+        system_root: Option<BtreeHeader>,
+        freed_root: Option<BtreeHeader>,
         transaction_id: TransactionId,
         eventual: bool,
         two_phase: bool,
@@ -570,9 +569,9 @@ impl TransactionalMemory {
     // Make changes visible, without a durability guarantee
     pub(crate) fn non_durable_commit(
         &self,
-        data_root: Option<(PageNumber, Checksum)>,
-        system_root: Option<(PageNumber, Checksum)>,
-        freed_root: Option<(PageNumber, Checksum)>,
+        data_root: Option<BtreeHeader>,
+        system_root: Option<BtreeHeader>,
+        freed_root: Option<BtreeHeader>,
         transaction_id: TransactionId,
     ) -> Result {
         // All mutable pages must be dropped, this ensures that when a transaction completes
@@ -681,9 +680,7 @@ impl TransactionalMemory {
             mem,
             page_number,
             #[cfg(debug_assertions)]
-            open_pages: &self.read_page_ref_counts,
-            #[cfg(not(debug_assertions))]
-            _debug_lifetime: Default::default(),
+            open_pages: self.read_page_ref_counts.clone(),
         })
     }
 
@@ -724,9 +721,7 @@ impl TransactionalMemory {
             mem,
             page_number,
             #[cfg(debug_assertions)]
-            open_pages: &self.open_dirty_pages,
-            #[cfg(not(debug_assertions))]
-            _debug_lifetime: Default::default(),
+            open_pages: self.open_dirty_pages.clone(),
         })
     }
 
@@ -739,7 +734,7 @@ impl TransactionalMemory {
         }
     }
 
-    pub(crate) fn get_data_root(&self) -> Option<(PageNumber, Checksum)> {
+    pub(crate) fn get_data_root(&self) -> Option<BtreeHeader> {
         let state = self.state.lock().unwrap();
         if self.read_from_secondary.load(Ordering::Acquire) {
             state.header.secondary_slot().user_root
@@ -748,7 +743,7 @@ impl TransactionalMemory {
         }
     }
 
-    pub(crate) fn get_system_root(&self) -> Option<(PageNumber, Checksum)> {
+    pub(crate) fn get_system_root(&self) -> Option<BtreeHeader> {
         let state = self.state.lock().unwrap();
         if self.read_from_secondary.load(Ordering::Acquire) {
             state.header.secondary_slot().system_root
@@ -757,7 +752,7 @@ impl TransactionalMemory {
         }
     }
 
-    pub(crate) fn get_freed_root(&self) -> Option<(PageNumber, Checksum)> {
+    pub(crate) fn get_freed_root(&self) -> Option<BtreeHeader> {
         let state = self.state.lock().unwrap();
         if self.read_from_secondary.load(Ordering::Acquire) {
             state.header.secondary_slot().freed_root
@@ -887,9 +882,7 @@ impl TransactionalMemory {
             mem,
             page_number,
             #[cfg(debug_assertions)]
-            open_pages: &self.open_dirty_pages,
-            #[cfg(not(debug_assertions))]
-            _debug_lifetime: Default::default(),
+            open_pages: self.open_dirty_pages.clone(),
         })
     }
 

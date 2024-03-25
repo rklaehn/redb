@@ -1,7 +1,8 @@
+use rand::random;
 use redb::backends::InMemoryBackend;
 use redb::{
-    Database, MultimapTableDefinition, MultimapTableHandle, Range, ReadableTable, RedbKey,
-    RedbValue, TableDefinition, TableError, TableHandle, TypeName,
+    Database, Key, MultimapTableDefinition, MultimapTableHandle, Range, ReadableTable,
+    ReadableTableMetadata, TableDefinition, TableError, TableHandle, TypeName, Value,
 };
 use std::cmp::Ordering;
 #[cfg(not(target_os = "wasi"))]
@@ -35,6 +36,8 @@ fn len() {
     let read_txn = db.begin_read().unwrap();
     let table = read_txn.open_table(STR_TABLE).unwrap();
     assert_eq!(table.len().unwrap(), 3);
+    let untyped_table = read_txn.open_untyped_table(STR_TABLE).unwrap();
+    assert_eq!(untyped_table.len().unwrap(), 3);
 }
 
 #[test]
@@ -142,7 +145,7 @@ fn pop() {
 }
 
 #[test]
-fn drain() {
+fn extract_if() {
     let tmpfile = create_tempfile();
     let db = Database::create(tmpfile.path()).unwrap();
     let write_txn = db.begin_write().unwrap();
@@ -151,11 +154,23 @@ fn drain() {
         for i in 0..10 {
             table.insert(&i, &i).unwrap();
         }
-        // Test draining uncommitted data
-        drop(table.drain(0..10).unwrap());
-        for i in 0..10 {
-            table.insert(&i, &i).unwrap();
+        // Test retain uncommitted data
+        let mut extracted = table.extract_if(|k, _| k >= 5).unwrap();
+        assert_eq!(extracted.next().unwrap().unwrap().0.value(), 5);
+        drop(extracted);
+        assert_eq!(table.len().unwrap(), 9);
+
+        let mut extracted = table.extract_from_if(5.., |k, _| k < 8).unwrap();
+        assert_eq!(extracted.next().unwrap().unwrap().0.value(), 6);
+        assert_eq!(extracted.next().unwrap().unwrap().0.value(), 7);
+        assert!(extracted.next().is_none());
+        drop(extracted);
+        assert_eq!(table.len().unwrap(), 7);
+
+        for i in 5..8 {
+            assert!(table.insert(&i, &i).unwrap().is_none());
         }
+        assert_eq!(table.len().unwrap(), 10);
     }
     write_txn.commit().unwrap();
 
@@ -163,35 +178,37 @@ fn drain() {
     {
         let mut table = write_txn.open_table(U64_TABLE).unwrap();
         assert_eq!(table.len().unwrap(), 10);
-        for (i, item) in table.drain(0..5).unwrap().enumerate() {
-            let (k, v) = item.unwrap();
-            assert_eq!(i as u64, k.value());
-            assert_eq!(i as u64, v.value());
-        }
-        assert_eq!(table.len().unwrap(), 5);
-        let mut i = 5u64;
-        for item in table.range(0..10).unwrap() {
-            let (k, v) = item.unwrap();
-            assert_eq!(i, k.value());
-            assert_eq!(i, v.value());
-            i += 1;
-        }
+        let mut extracted = table.extract_if(|_, _| true).unwrap();
+        assert_eq!(extracted.next().unwrap().unwrap().1.value(), 0);
+        drop(extracted);
+        assert_eq!(table.len().unwrap(), 9);
     }
     write_txn.abort().unwrap();
 
-    // Check that dropping the iter early works too
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(U64_TABLE).unwrap();
         assert_eq!(table.len().unwrap(), 10);
-        drop(table.drain(0..5).unwrap());
-        assert_eq!(table.len().unwrap(), 5);
+        for _ in table.extract_if(|x, _| x % 2 != 0).unwrap() {}
+        table.extract_if(|_, _| true).unwrap().rev().next();
     }
-    write_txn.abort().unwrap();
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_write().unwrap();
+    {
+        let table = read_txn.open_table(U64_TABLE).unwrap();
+        assert_eq!(table.len().unwrap(), 4);
+        let mut iter = table.iter().unwrap();
+        for x in [0, 2, 4, 6] {
+            let (k, v) = iter.next().unwrap().unwrap();
+            assert_eq!(k.value(), x);
+            assert_eq!(k.value(), v.value());
+        }
+    }
 }
 
 #[test]
-fn drain_filter() {
+fn retain() {
     let tmpfile = create_tempfile();
     let db = Database::create(tmpfile.path()).unwrap();
     let write_txn = db.begin_write().unwrap();
@@ -200,17 +217,24 @@ fn drain_filter() {
         for i in 0..10 {
             table.insert(&i, &i).unwrap();
         }
-        // Test draining uncommitted data
-        drop(table.drain_filter(0..10, |k, _| k < 5).unwrap());
+        // Test retain uncommitted data
+        table.retain(|k, _| k >= 5).unwrap();
         for i in 0..5 {
-            table.insert(&i, &i).unwrap();
+            assert!(table.insert(&i, &i).unwrap().is_none());
         }
         assert_eq!(table.len().unwrap(), 10);
 
         // Test matching on the value
-        drop(table.drain_filter(0..10, |_, v| v < 5).unwrap());
+        table.retain(|_, v| v >= 5).unwrap();
         for i in 0..5 {
-            table.insert(&i, &i).unwrap();
+            assert!(table.insert(&i, &i).unwrap().is_none());
+        }
+        assert_eq!(table.len().unwrap(), 10);
+
+        // Test retain_in
+        table.retain_in(..5, |_, _| false).unwrap();
+        for i in 0..5 {
+            assert!(table.insert(&i, &i).unwrap().is_none());
         }
         assert_eq!(table.len().unwrap(), 10);
     }
@@ -220,12 +244,9 @@ fn drain_filter() {
     {
         let mut table = write_txn.open_table(U64_TABLE).unwrap();
         assert_eq!(table.len().unwrap(), 10);
-        for (i, item) in table.drain_filter(0.., |x, _| x < 5).unwrap().enumerate() {
-            let (k, v) = item.unwrap();
-            assert_eq!(i as u64, k.value());
-            assert_eq!(i as u64, v.value());
-        }
+        table.retain(|x, _| x >= 5).unwrap();
         assert_eq!(table.len().unwrap(), 5);
+
         let mut i = 5u64;
         for item in table.range(0..10).unwrap() {
             let (k, v) = item.unwrap();
@@ -236,15 +257,23 @@ fn drain_filter() {
     }
     write_txn.abort().unwrap();
 
-    // Check that dropping the iter early works too
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(U64_TABLE).unwrap();
-        assert_eq!(table.len().unwrap(), 10);
-        drop(table.drain_filter(0.., |x, _| x < 5).unwrap());
-        assert_eq!(table.len().unwrap(), 5);
+        table.retain(|x, _| x % 2 == 0).unwrap();
     }
-    write_txn.abort().unwrap();
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_write().unwrap();
+    {
+        let table = read_txn.open_table(U64_TABLE).unwrap();
+        assert_eq!(table.len().unwrap(), 5);
+        for entry in table.iter().unwrap() {
+            let (k, v) = entry.unwrap();
+            assert_eq!(k.value() % 2, 0);
+            assert_eq!(k.value(), v.value());
+        }
+    }
 }
 
 #[test]
@@ -697,6 +726,61 @@ fn tuple12_type() {
             .unwrap()
             .value(),
         (0, 123)
+    );
+}
+
+#[test]
+#[allow(clippy::type_complexity)]
+fn generic_array_type() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let table_def1: TableDefinition<[u8; 3], [u64; 2]> = TableDefinition::new("table1");
+    let table_def2: TableDefinition<[(u8, &str); 2], [Option<&str>; 2]> =
+        TableDefinition::new("table2");
+    let table_def3: TableDefinition<[&[u8]; 2], [f32; 2]> = TableDefinition::new("table3");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table1 = write_txn.open_table(table_def1).unwrap();
+        let mut table2 = write_txn.open_table(table_def2).unwrap();
+        let mut table3 = write_txn.open_table(table_def3).unwrap();
+        table1.insert([0, 1, 2], &[4, 5]).unwrap();
+        table2
+            .insert([(0, "hi"), (1, "world")], [None, Some("test")])
+            .unwrap();
+        table3
+            .insert([b"hi".as_slice(), b"world".as_slice()], [4.0, 5.0])
+            .unwrap();
+        table3
+            .insert([b"longlong".as_slice(), b"longlong".as_slice()], [0.0, 0.0])
+            .unwrap();
+        table3
+            .insert([b"s".as_slice(), b"s".as_slice()], [0.0, 0.0])
+            .unwrap();
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    let table1 = read_txn.open_table(table_def1).unwrap();
+    let table2 = read_txn.open_table(table_def2).unwrap();
+    let table3 = read_txn.open_table(table_def3).unwrap();
+    assert_eq!(table1.get(&[0, 1, 2]).unwrap().unwrap().value(), [4, 5]);
+    assert_eq!(
+        table2
+            .get(&[(0, "hi"), (1, "world")])
+            .unwrap()
+            .unwrap()
+            .value(),
+        [None, Some("test")]
+    );
+    assert_eq!(
+        table3
+            .get(&[b"hi".as_slice(), b"world".as_slice()])
+            .unwrap()
+            .unwrap()
+            .value(),
+        [4.0, 5.0]
     );
 }
 
@@ -1247,7 +1331,7 @@ fn range_lifetime() {
 }
 
 #[test]
-fn drain_lifetime() {
+fn range_arc() {
     let tmpfile = create_tempfile();
     let db = Database::create(tmpfile.path()).unwrap();
 
@@ -1260,19 +1344,18 @@ fn drain_lifetime() {
     }
     write_txn.commit().unwrap();
 
-    let txn = db.begin_write().unwrap();
-    let mut table = txn.open_table(definition).unwrap();
-
     let mut iter = {
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(definition).unwrap();
         let start = "hello".to_string();
-        table.drain::<&str>(start.as_str()..).unwrap()
+        table.range::<&str>(start.as_str()..).unwrap()
     };
     assert_eq!(iter.next().unwrap().unwrap().1.value(), "world");
     assert!(iter.next().is_none());
 }
 
 #[test]
-fn drain_filter_lifetime() {
+fn range_clone() {
     let tmpfile = create_tempfile();
     let db = Database::create(tmpfile.path()).unwrap();
 
@@ -1282,18 +1365,14 @@ fn drain_filter_lifetime() {
     {
         let mut table = write_txn.open_table(definition).unwrap();
         table.insert("hello", "world").unwrap();
+        let mut iter1 = table.iter().unwrap();
+        let mut iter2 = iter1.clone();
+        let (k1, v1) = iter1.next().unwrap().unwrap();
+        let (k2, v2) = iter2.next().unwrap().unwrap();
+        assert_eq!(k1.value(), k2.value());
+        assert_eq!(v1.value(), v2.value());
     }
     write_txn.commit().unwrap();
-
-    let txn = db.begin_write().unwrap();
-    let mut table = txn.open_table(definition).unwrap();
-
-    let mut iter = {
-        let start = "hello".to_string();
-        table.drain_filter(start.as_str().., |_, _| true).unwrap()
-    };
-    assert_eq!(iter.next().unwrap().unwrap().1.value(), "world");
-    assert!(iter.next().is_none());
 }
 
 #[test]
@@ -1301,7 +1380,7 @@ fn custom_ordering() {
     #[derive(Debug)]
     struct ReverseKey(Vec<u8>);
 
-    impl RedbValue for ReverseKey {
+    impl Value for ReverseKey {
         type SelfType<'a> = ReverseKey
         where
         Self: 'a;
@@ -1333,7 +1412,7 @@ fn custom_ordering() {
         }
     }
 
-    impl RedbKey for ReverseKey {
+    impl Key for ReverseKey {
         fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
             data2.cmp(data1)
         }
@@ -1462,7 +1541,6 @@ fn concurrent_write_transactions_block() {
     let (sender, receiver) = sync::mpsc::channel();
 
     let t = {
-        let db = db.clone();
         std::thread::spawn(move || {
             sender.send(()).unwrap();
             db.begin_write().unwrap().commit().unwrap();
@@ -1499,52 +1577,6 @@ fn iter() {
 }
 
 #[test]
-fn drain_next_back() {
-    let tmpfile = create_tempfile();
-    let db = Database::create(tmpfile.path()).unwrap();
-    let write_txn = db.begin_write().unwrap();
-    {
-        let mut table = write_txn.open_table(U64_TABLE).unwrap();
-        for i in 0..10 {
-            table.insert(&i, &i).unwrap();
-        }
-    }
-    write_txn.commit().unwrap();
-
-    let write_txn = db.begin_write().unwrap();
-    let mut table = write_txn.open_table(U64_TABLE).unwrap();
-    let mut iter = table.drain(0..10).unwrap();
-    for i in (0..10).rev() {
-        let (k, v) = iter.next_back().unwrap().unwrap();
-        assert_eq!(i, k.value());
-        assert_eq!(i, v.value());
-    }
-}
-
-#[test]
-fn drain_filter_all_elements_next_back() {
-    let tmpfile = create_tempfile();
-    let db = Database::create(tmpfile.path()).unwrap();
-    let write_txn = db.begin_write().unwrap();
-    {
-        let mut table = write_txn.open_table(U64_TABLE).unwrap();
-        for i in 0..10 {
-            table.insert(&i, &i).unwrap();
-        }
-    }
-    write_txn.commit().unwrap();
-
-    let write_txn = db.begin_write().unwrap();
-    let mut table = write_txn.open_table(U64_TABLE).unwrap();
-    let mut iter = table.drain_filter(0..10, |_, _| true).unwrap();
-    for i in (0..10).rev() {
-        let (k, v) = iter.next_back().unwrap().unwrap();
-        assert_eq!(i, k.value());
-        assert_eq!(i, v.value());
-    }
-}
-
-#[test]
 fn signature_lifetimes() {
     let tmpfile = create_tempfile();
     let db = Database::create(tmpfile.path()).unwrap();
@@ -1573,14 +1605,11 @@ fn signature_lifetimes() {
             table.range(key.as_str()..).unwrap()
         };
 
-        let _ = {
-            let key = "hi".to_string();
-            table.drain(key.as_str()..).unwrap()
-        };
+        let _ = { table.extract_if(|_, _| true).unwrap() };
 
         let _ = {
             let key = "hi".to_string();
-            table.drain_filter(key.as_str().., |_, _| true).unwrap()
+            table.extract_from_if(key.as_str().., |_, _| true).unwrap()
         };
     }
     write_txn.commit().unwrap();
@@ -1588,7 +1617,7 @@ fn signature_lifetimes() {
 
 #[test]
 fn generic_signature_lifetimes() {
-    fn write_key_generic<K: RedbKey>(
+    fn write_key_generic<K: Key>(
         table: TableDefinition<K, &[u8]>,
         key: K::SelfType<'_>,
         db: &Database,
@@ -1602,7 +1631,7 @@ fn generic_signature_lifetimes() {
         write_txn.commit().unwrap();
     }
 
-    fn read_key_generic<K: RedbKey>(
+    fn read_key_generic<K: Key>(
         table: TableDefinition<K, &[u8]>,
         key: K::SelfType<'_>,
         db: &Database,
@@ -1651,4 +1680,30 @@ fn char_type() {
     assert_eq!(iter.next().unwrap().unwrap().0.value(), 'a');
     assert_eq!(iter.next().unwrap().unwrap().0.value(), 'b');
     assert!(iter.next().is_none());
+}
+
+// Test that &[u8; N] and [u8; N] are effectively the same
+#[test]
+fn u8_array_serialization() {
+    assert_eq!(
+        <&[u8; 7] as Value>::type_name(),
+        <[u8; 7] as Value>::type_name()
+    );
+    let fixed_value: u128 = random();
+    let fixed_serialized = fixed_value.to_le_bytes();
+    for _ in 0..1000 {
+        let x: u128 = random();
+        let x_serialized = x.to_le_bytes();
+        let ref_x_serialized = &x_serialized;
+        let u8_ref_serialized = <&[u8; 16] as Value>::as_bytes(&ref_x_serialized);
+        let u8_generic_serialized = <[u8; 16] as Value>::as_bytes(&x_serialized);
+        assert_eq!(
+            u8_ref_serialized.as_slice(),
+            u8_generic_serialized.as_slice()
+        );
+        assert_eq!(u8_ref_serialized.as_slice(), x_serialized.as_slice());
+        let ref_order = <&[u8; 16] as Key>::compare(&x_serialized, &fixed_serialized);
+        let generic_order = <[u8; 16] as Key>::compare(&x_serialized, &fixed_serialized);
+        assert_eq!(ref_order, generic_order);
+    }
 }

@@ -1,5 +1,5 @@
-use crate::tree_store::{FILE_FORMAT_VERSION, MAX_VALUE_LENGTH};
-use crate::TypeName;
+use crate::tree_store::{FILE_FORMAT_VERSION2, MAX_VALUE_LENGTH};
+use crate::{ReadTransaction, TypeName};
 use std::fmt::{Display, Formatter};
 use std::sync::PoisonError;
 use std::{io, panic};
@@ -222,7 +222,7 @@ impl Display for DatabaseError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             DatabaseError::UpgradeRequired(actual) => {
-                write!(f, "Manual upgrade required. Expected file format version {FILE_FORMAT_VERSION}, but file is version {actual}")
+                write!(f, "Manual upgrade required. Expected file format version {FILE_FORMAT_VERSION2}, but file is version {actual}")
             }
             DatabaseError::RepairAborted => {
                 write!(f, "Database repair aborted.")
@@ -334,12 +334,15 @@ impl std::error::Error for CompactionError {}
 pub enum TransactionError {
     /// Error from underlying storage
     Storage(StorageError),
+    /// The transaction is still referenced by a table or other object
+    ReadTransactionStillInUse(ReadTransaction),
 }
 
 impl TransactionError {
     pub(crate) fn into_storage_error(self) -> StorageError {
         match self {
             TransactionError::Storage(storage) => storage,
+            _ => unreachable!(),
         }
     }
 }
@@ -348,6 +351,9 @@ impl From<TransactionError> for Error {
     fn from(err: TransactionError) -> Error {
         match err {
             TransactionError::Storage(storage) => storage.into(),
+            TransactionError::ReadTransactionStillInUse(txn) => {
+                Error::ReadTransactionStillInUse(txn)
+            }
         }
     }
 }
@@ -362,6 +368,9 @@ impl Display for TransactionError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             TransactionError::Storage(storage) => storage.fmt(f),
+            TransactionError::ReadTransactionStillInUse(_) => {
+                write!(f, "Transaction still in use")
+            }
         }
     }
 }
@@ -453,6 +462,8 @@ pub enum Error {
     TableAlreadyOpen(String, &'static panic::Location<'static>),
     Io(io::Error),
     LockPoisoned(&'static panic::Location<'static>),
+    /// The transaction is still referenced by a table or other object
+    ReadTransactionStillInUse(ReadTransaction),
 }
 
 impl<T> From<PoisonError<T>> for Error {
@@ -474,7 +485,7 @@ impl Display for Error {
                 write!(f, "DB corrupted: {msg}")
             }
             Error::UpgradeRequired(actual) => {
-                write!(f, "Manual upgrade required. Expected file format version {FILE_FORMAT_VERSION}, but file is version {actual}")
+                write!(f, "Manual upgrade required. Expected file format version {FILE_FORMAT_VERSION2}, but file is version {actual}")
             }
             Error::ValueTooLarge(len) => {
                 write!(
@@ -542,6 +553,9 @@ impl Display for Error {
             }
             Error::InvalidSavepoint => {
                 write!(f, "Savepoint is invalid or cannot be created.")
+            }
+            Error::ReadTransactionStillInUse(_) => {
+                write!(f, "Transaction still in use")
             }
         }
     }
